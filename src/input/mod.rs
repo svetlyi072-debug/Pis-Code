@@ -56,12 +56,28 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
         (KeyCode::Char('v'), m) if m.contains(KeyModifiers::CONTROL) => editor.paste(),
 
         (KeyCode::Enter, _) => editor.newline(),
+        (KeyCode::Backspace, m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.delete_word_backward()
+        }
         (KeyCode::Backspace, _) => editor.backspace(),
+        (KeyCode::Delete, m) if m.contains(KeyModifiers::CONTROL) => editor.delete_word_forward(),
         (KeyCode::Delete, _) => editor.delete_forward(),
         (KeyCode::Tab, _) => editor.insert_tab(),
 
+        (KeyCode::Left, m)
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            editor.move_word_left_select()
+        }
+        (KeyCode::Left, m) if m.contains(KeyModifiers::CONTROL) => editor.move_word_left(),
         (KeyCode::Left, m) if m.contains(KeyModifiers::SHIFT) => editor.move_left_select(),
         (KeyCode::Left, _) => editor.move_left(),
+        (KeyCode::Right, m)
+            if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>
+        {
+            editor.move_word_right_select()
+        }
+        (KeyCode::Right, m) if m.contains(KeyModifiers::CONTROL) => editor.move_word_right(),
         (KeyCode::Right, m) if m.contains(KeyModifiers::SHIFT) => editor.move_right_select(),
         (KeyCode::Right, _) => editor.move_right(),
         (KeyCode::Up, m) if m.contains(KeyModifiers::SHIFT) => editor.move_up_select(),

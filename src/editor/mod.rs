@@ -17,6 +17,13 @@ enum EditGroup {
     Paste,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Whitespace,
+    Word,
+    Other,
+}
+
 // The real OS clipboard is global, external, mutable state shared with
 // everything else on the machine — reading/writing it from unit tests
 // would make them flaky (parallel test threads racing on it, or picking up
@@ -139,6 +146,55 @@ impl Editor {
         line.chars()
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect()
+    }
+
+    fn char_class(c: char) -> CharClass {
+        if c.is_whitespace() {
+            CharClass::Whitespace
+        } else if c.is_alphanumeric() || c == '_' {
+            CharClass::Word
+        } else {
+            CharClass::Other
+        }
+    }
+
+    /// The column one word to the left of `col` on `line`: skip any
+    /// whitespace immediately before the cursor, then skip the run of
+    /// same-class characters before that (identifiers and runs of
+    /// punctuation are treated as separate word stops).
+    fn prev_word_boundary(line: &str, col: usize) -> usize {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = col.min(chars.len());
+        while i > 0 && Self::char_class(chars[i - 1]) == CharClass::Whitespace {
+            i -= 1;
+        }
+        if i == 0 {
+            return 0;
+        }
+        let class = Self::char_class(chars[i - 1]);
+        while i > 0 && Self::char_class(chars[i - 1]) == class {
+            i -= 1;
+        }
+        i
+    }
+
+    /// The column one word to the right of `col` on `line`; mirrors
+    /// `prev_word_boundary`.
+    fn next_word_boundary(line: &str, col: usize) -> usize {
+        let chars: Vec<char> = line.chars().collect();
+        let len = chars.len();
+        let mut i = col.min(len);
+        while i < len && Self::char_class(chars[i]) == CharClass::Whitespace {
+            i += 1;
+        }
+        if i == len {
+            return len;
+        }
+        let class = Self::char_class(chars[i]);
+        while i < len && Self::char_class(chars[i]) == class {
+            i += 1;
+        }
+        i
     }
 
     // ---- low level buffer mutation (no undo bookkeeping) ----
@@ -659,6 +715,93 @@ impl Editor {
         self.page_down_impl(page, true);
     }
 
+    fn move_word_left_impl(&mut self, select: bool) {
+        self.begin_move(select);
+        if self.cursor_col == 0 {
+            if self.cursor_row > 0 {
+                self.cursor_row -= 1;
+                self.cursor_col = self.current_line_char_len();
+            }
+        } else {
+            let line = self.current_line().to_string();
+            self.cursor_col = Self::prev_word_boundary(&line, self.cursor_col);
+        }
+        self.desired_col = self.cursor_col;
+    }
+
+    fn move_word_right_impl(&mut self, select: bool) {
+        self.begin_move(select);
+        let len = self.current_line_char_len();
+        if self.cursor_col >= len {
+            if self.cursor_row + 1 < self.lines.len() {
+                self.cursor_row += 1;
+                self.cursor_col = 0;
+            }
+        } else {
+            let line = self.current_line().to_string();
+            self.cursor_col = Self::next_word_boundary(&line, self.cursor_col);
+        }
+        self.desired_col = self.cursor_col;
+    }
+
+    pub fn move_word_left(&mut self) {
+        self.move_word_left_impl(false);
+    }
+    pub fn move_word_left_select(&mut self) {
+        self.move_word_left_impl(true);
+    }
+    pub fn move_word_right(&mut self) {
+        self.move_word_right_impl(false);
+    }
+    pub fn move_word_right_select(&mut self) {
+        self.move_word_right_impl(true);
+    }
+
+    /// Ctrl+Backspace: deletes back to the previous word boundary, or
+    /// merges with the previous line at column 0 (same as plain
+    /// backspace there).
+    pub fn delete_word_backward(&mut self) {
+        self.confirm_quit = false;
+        if self.delete_selection_as(EditGroup::Delete) {
+            self.desired_col = self.cursor_col;
+            return;
+        }
+        if self.cursor_col == 0 {
+            self.backspace();
+            return;
+        }
+        self.begin_edit(EditGroup::Delete);
+        let line = self.current_line().to_string();
+        let new_col = Self::prev_word_boundary(&line, self.cursor_col);
+        let row = self.cursor_row;
+        self.remove_chars(row, new_col, self.cursor_col);
+        self.cursor_col = new_col;
+        self.desired_col = self.cursor_col;
+        self.modified = true;
+    }
+
+    /// Ctrl+Delete: deletes forward to the next word boundary, or merges
+    /// with the next line at end-of-line (same as plain delete there).
+    pub fn delete_word_forward(&mut self) {
+        self.confirm_quit = false;
+        if self.delete_selection_as(EditGroup::Delete) {
+            self.desired_col = self.cursor_col;
+            return;
+        }
+        let len = self.current_line_char_len();
+        if self.cursor_col >= len {
+            self.delete_forward();
+            return;
+        }
+        self.begin_edit(EditGroup::Delete);
+        let line = self.current_line().to_string();
+        let new_col = Self::next_word_boundary(&line, self.cursor_col);
+        let row = self.cursor_row;
+        self.remove_chars(row, self.cursor_col, new_col);
+        self.desired_col = self.cursor_col;
+        self.modified = true;
+    }
+
     pub fn select_all(&mut self) {
         self.confirm_quit = false;
         self.reset_edit_group();
@@ -881,6 +1024,65 @@ mod tests {
         ed.backspace();
         assert_eq!(ed.lines[0], "");
         assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_previous_word() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "int foo = bar();");
+        ed.delete_word_backward(); // removes trailing "();"
+        assert_eq!(ed.lines[0], "int foo = bar");
+        ed.delete_word_backward(); // removes "bar"
+        assert_eq!(ed.lines[0], "int foo = ");
+        // trailing whitespace and the punctuation run before it ("= ") go
+        // together in one press, same as most editors' Ctrl+Backspace
+        ed.delete_word_backward();
+        assert_eq!(ed.lines[0], "int foo ");
+    }
+
+    #[test]
+    fn ctrl_backspace_at_line_start_merges_with_previous_line() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "abc");
+        ed.newline();
+        type_str(&mut ed, "def");
+        ed.move_home();
+        ed.delete_word_backward();
+        assert_eq!(ed.lines.len(), 1);
+        assert_eq!(ed.lines[0], "abcdef");
+    }
+
+    #[test]
+    fn ctrl_delete_deletes_next_word() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "foo bar");
+        ed.move_home();
+        ed.delete_word_forward(); // removes "foo"
+        assert_eq!(ed.lines[0], " bar");
+    }
+
+    #[test]
+    fn ctrl_left_right_jump_by_word() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "foo.bar(baz)");
+        ed.move_home();
+        ed.move_word_right(); // -> end of "foo"
+        assert_eq!(ed.cursor_col, 3);
+        ed.move_word_right(); // -> end of "."
+        assert_eq!(ed.cursor_col, 4);
+        ed.move_word_right(); // -> end of "bar"
+        assert_eq!(ed.cursor_col, 7);
+        ed.move_word_left(); // -> start of "bar"
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn ctrl_shift_left_selects_by_word() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "hello world");
+        ed.move_end();
+        ed.move_word_left_select();
+        assert_eq!(ed.selection_bounds(), Some(((0, 6), (0, 11))));
     }
 
     #[test]

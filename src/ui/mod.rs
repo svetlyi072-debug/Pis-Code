@@ -46,7 +46,10 @@ pub fn draw(f: &mut Frame, editor: &mut Editor, highlighter: &Highlighter) {
         lines.push(Line::from(spans));
     }
 
-    let paragraph = Paragraph::new(lines).style(Style::default().bg(Color::Rgb(0x1b, 0x1e, 0x28)));
+    // No explicit background here: leaving cells unstyled lets the
+    // terminal's own background show through (including a transparent /
+    // wallpapered background in terminals like Ghostty, Kitty, WezTerm).
+    let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, text_area);
 
     draw_status(f, status_area, editor);
