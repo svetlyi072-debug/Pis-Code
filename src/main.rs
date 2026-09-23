@@ -15,7 +15,6 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
 use syntax::Highlighter;
 
 fn main() -> Result<()> {
@@ -46,23 +45,35 @@ fn main() -> Result<()> {
     result
 }
 
+/// Redraws only when something actually changed, instead of on a fixed
+/// tick — an idle editor should burn ~0% CPU, not repaint several times a
+/// second forever. `event::read()` blocks in the OS until an event
+/// actually arrives, so there is no polling loop to tune.
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     editor: &mut Editor,
     highlighter: &Highlighter,
 ) -> Result<()> {
-    loop {
-        terminal.draw(|f| ui::draw(f, editor, highlighter))?;
+    terminal.draw(|f| ui::draw(f, editor, highlighter))?;
 
-        if event::poll(Duration::from_millis(150))? {
-            if let Event::Key(key) = event::read()? {
+    loop {
+        let mut needs_redraw = false;
+        match event::read()? {
+            Event::Key(key) => {
                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                     match input::handle_key(editor, key) {
                         input::Action::Quit => return Ok(()),
                         input::Action::Continue => {}
                     }
+                    needs_redraw = true;
                 }
             }
+            Event::Resize(_, _) => needs_redraw = true,
+            _ => {}
+        }
+
+        if needs_redraw {
+            terminal.draw(|f| ui::draw(f, editor, highlighter))?;
         }
     }
 }

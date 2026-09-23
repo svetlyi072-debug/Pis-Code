@@ -308,8 +308,32 @@ impl Editor {
 
     // ---- editing ----
 
-    /// Insert a typed character, applying VS Code-style smart bracket
-    /// pairing for `{`, `(`, `[` and type-over for their closers.
+    /// Counts (unescaped) occurrences of `quote` before the cursor on the
+    /// current line — an odd count means we're sitting inside an open
+    /// string, which is how we tell "close this string" apart from "open a
+    /// new one" when the same character is used for both ends.
+    fn quote_count_before_cursor(&self, quote: char) -> usize {
+        let mut count = 0;
+        let mut escaped = false;
+        for (i, ch) in self.current_line().chars().enumerate() {
+            if i >= self.cursor_col {
+                break;
+            }
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Insert a typed character, applying VS Code-style smart pairing for
+    /// `{`, `(`, `[`, `"`, `'` and type-over for their closers.
     pub fn insert_char(&mut self, c: char) {
         self.confirm_quit = false;
         if self.has_selection() {
@@ -333,6 +357,21 @@ impl Editor {
                 // inserting a duplicate.
                 self.begin_edit(EditGroup::Insert);
                 self.cursor_col += 1;
+            }
+            '"' | '\'' => {
+                self.begin_edit(EditGroup::Insert);
+                if self.char_at_cursor() == Some(c) {
+                    // Type over an already-present closing quote.
+                    self.cursor_col += 1;
+                } else if self.quote_count_before_cursor(c) % 2 == 1 {
+                    // We're inside an open string; this closes it, so
+                    // don't also autoclose a fresh pair.
+                    self.insert_raw(c);
+                } else {
+                    self.insert_raw(c);
+                    self.insert_raw(c);
+                    self.cursor_col -= 1;
+                }
             }
             _ => {
                 self.begin_edit(EditGroup::Insert);
@@ -446,7 +485,11 @@ impl Editor {
             let after = self.char_at_cursor();
             let is_pair = matches!(
                 (before, after),
-                (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']'))
+                (Some('{'), Some('}'))
+                    | (Some('('), Some(')'))
+                    | (Some('['), Some(']'))
+                    | (Some('"'), Some('"'))
+                    | (Some('\''), Some('\''))
             );
             if is_pair {
                 let row = self.cursor_row;
@@ -796,6 +839,48 @@ mod tests {
         ed.insert_char(')');
         assert_eq!(ed.lines[0], "()");
         assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn double_and_single_quotes_autoclose() {
+        let mut ed = new_editor();
+        ed.insert_char('"');
+        assert_eq!(ed.lines[0], "\"\"");
+        assert_eq!(ed.cursor_col, 1);
+
+        let mut ed = new_editor();
+        ed.insert_char('\'');
+        assert_eq!(ed.lines[0], "''");
+        assert_eq!(ed.cursor_col, 1);
+    }
+
+    #[test]
+    fn typing_quote_over_existing_close_types_over() {
+        let mut ed = new_editor();
+        ed.insert_char('"');
+        ed.insert_char('"');
+        assert_eq!(ed.lines[0], "\"\"");
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn typing_quote_to_close_an_open_string_does_not_autoclose_again() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "\"hello");
+        // cursor is now after "hello, i.e. not adjacent to a matching
+        // closer — closing the string should just insert one quote.
+        ed.insert_char('"');
+        assert_eq!(ed.lines[0], "\"hello\"");
+        assert_eq!(ed.cursor_col, 7);
+    }
+
+    #[test]
+    fn backspace_deletes_empty_quote_pair_as_unit() {
+        let mut ed = new_editor();
+        ed.insert_char('"');
+        ed.backspace();
+        assert_eq!(ed.lines[0], "");
+        assert_eq!(ed.cursor_col, 0);
     }
 
     #[test]
