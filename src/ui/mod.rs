@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use std::ops::Range;
 
 const GUTTER_MIN: usize = 4;
 
@@ -37,7 +38,9 @@ pub fn draw(f: &mut Frame, editor: &mut Editor, highlighter: &Highlighter) {
         let mut spans = vec![Span::styled(num, Style::default().fg(Color::DarkGray))];
 
         if let Some(row_spans) = highlighted.get(file_row) {
-            spans.extend(slice_spans(row_spans, editor.col_scroll, content_width));
+            let visible = slice_spans(row_spans, editor.col_scroll, content_width);
+            let sel = editor.selection_col_range(file_row);
+            spans.extend(apply_selection(visible, editor.col_scroll, sel));
         }
 
         lines.push(Line::from(spans));
@@ -120,4 +123,53 @@ fn slice_spans<'a>(spans: &[(Style, String)], start: usize, width: usize) -> Vec
     }
 
     result
+}
+
+/// Splits `spans` (already the visible-window slice starting at absolute
+/// column `col_scroll`) wherever a selection boundary falls, reversing
+/// video on the selected run so it reads as highlighted text.
+fn apply_selection<'a>(
+    spans: Vec<Span<'a>>,
+    col_scroll: usize,
+    sel: Option<Range<usize>>,
+) -> Vec<Span<'a>> {
+    let Some(sel) = sel else {
+        return spans;
+    };
+    if sel.is_empty() {
+        return spans;
+    }
+
+    let mut result = Vec::new();
+    let mut abs_col = col_scroll;
+    for span in spans {
+        let style = span.style;
+        let text = span.content.into_owned();
+        let mut buf = String::new();
+        let mut buf_selected: Option<bool> = None;
+
+        for ch in text.chars() {
+            let is_sel = sel.contains(&abs_col);
+            if buf_selected == Some(!is_sel) {
+                push_run(&mut result, &buf, style, buf_selected == Some(true));
+                buf.clear();
+            }
+            buf_selected = Some(is_sel);
+            buf.push(ch);
+            abs_col += 1;
+        }
+        if !buf.is_empty() {
+            push_run(&mut result, &buf, style, buf_selected == Some(true));
+        }
+    }
+    result
+}
+
+fn push_run<'a>(out: &mut Vec<Span<'a>>, text: &str, style: Style, selected: bool) {
+    let style = if selected {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    };
+    out.push(Span::styled(text.to_string(), style));
 }
