@@ -104,7 +104,7 @@ impl Editor {
             col_scroll: 0,
             confirm_quit: false,
             status_message: String::from(
-                "^S save  ^Q quit  ^Z undo  ^Y redo  ^A select all  ^C copy  ^X cut  ^V paste",
+                "^S save  ^⇧S save+check  ^Q quit  ^Z undo  ^Y redo  ^A select all  ^C copy  ^X cut  ^V paste",
             ),
             status_is_error: false,
             selection_anchor: None,

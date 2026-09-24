@@ -36,10 +36,20 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
     }
 
     match (key.code, key.modifiers) {
-        (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+        // Ctrl+Shift+S: save and also run the Ctrl+S-style background
+        // diagnostics check. Plain Ctrl+S just saves. Terminals vary in
+        // whether they report the Shift as a modifier bit or as the
+        // uppercase char itself, so both count.
+        (KeyCode::Char(c @ ('s' | 'S')), m)
+            if m.contains(KeyModifiers::CONTROL)
+                && (m.contains(KeyModifiers::SHIFT) || c == 'S') =>
+        {
             if editor.save() {
                 return Action::TriggerCheck;
             }
+        }
+        (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+            editor.save();
         }
         (KeyCode::Char('q'), m) if m.contains(KeyModifiers::CONTROL) => {
             if editor.modified {
