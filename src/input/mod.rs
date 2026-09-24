@@ -4,6 +4,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Action {
     Continue,
     Quit,
+    /// A save just succeeded; the caller should kick off a background
+    /// Ctrl+S diagnostics check.
+    TriggerCheck,
 }
 
 const PAGE_SIZE: usize = 20;
@@ -34,7 +37,9 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
 
     match (key.code, key.modifiers) {
         (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
-            editor.save();
+            if editor.save() {
+                return Action::TriggerCheck;
+            }
         }
         (KeyCode::Char('q'), m) if m.contains(KeyModifiers::CONTROL) => {
             if editor.modified {

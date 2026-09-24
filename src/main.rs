@@ -1,3 +1,4 @@
+mod check;
 mod editor;
 mod file_io;
 mod input;
@@ -5,6 +6,7 @@ mod syntax;
 mod ui;
 
 use anyhow::{Context, Result};
+use check::{CheckMessage, Checker};
 use crossterm::event::{
     self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
@@ -20,6 +22,7 @@ use ratatui::Terminal;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use syntax::Highlighter;
 
 /// Tracks whether we pushed the Kitty keyboard protocol flags, so the
@@ -62,7 +65,8 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, &mut editor, &highlighter);
+    let mut checker = Checker::new();
+    let result = run_app(&mut terminal, &mut editor, &highlighter, &mut checker);
 
     if keyboard_enhanced {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
@@ -72,35 +76,89 @@ fn main() -> Result<()> {
     result
 }
 
-/// Redraws only when something actually changed, instead of on a fixed
-/// tick — an idle editor should burn ~0% CPU, not repaint several times a
-/// second forever. `event::read()` blocks in the OS until an event
-/// actually arrives, so there is no polling loop to tune.
+/// Redraws only when something actually changed, and only wakes up
+/// periodically (instead of redrawing on that tick) to check whether a
+/// background Ctrl+S diagnostics check has finished — an idle editor
+/// should burn ~0% CPU, not repaint several times a second forever.
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     editor: &mut Editor,
     highlighter: &Highlighter,
+    checker: &mut Checker,
 ) -> Result<()> {
     terminal.draw(|f| ui::draw(f, editor, highlighter))?;
 
     loop {
         let mut needs_redraw = false;
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
-                    match input::handle_key(editor, key) {
-                        input::Action::Quit => return Ok(()),
-                        input::Action::Continue => {}
+
+        if event::poll(Duration::from_millis(200))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                        match input::handle_key(editor, key) {
+                            input::Action::Quit => return Ok(()),
+                            input::Action::Continue => {}
+                            input::Action::TriggerCheck => {
+                                if checker.start(editor.file_path.clone()) {
+                                    editor.status_message = "Checking…".to_string();
+                                    editor.status_is_error = false;
+                                }
+                            }
+                        }
+                        needs_redraw = true;
                     }
-                    needs_redraw = true;
                 }
+                Event::Resize(_, _) => needs_redraw = true,
+                _ => {}
             }
-            Event::Resize(_, _) => needs_redraw = true,
-            _ => {}
+        } else if let Some(msg) = checker.poll() {
+            apply_check_message(editor, msg);
+            needs_redraw = true;
         }
 
         if needs_redraw {
             terminal.draw(|f| ui::draw(f, editor, highlighter))?;
+        }
+    }
+}
+
+fn apply_check_message(editor: &mut Editor, msg: CheckMessage) {
+    match msg {
+        CheckMessage::Finished(diagnostics) => {
+            let errors = diagnostics
+                .iter()
+                .filter(|d| d.severity == check::Severity::Error)
+                .count();
+            let warnings = diagnostics.len() - errors;
+            editor.status_message = if diagnostics.is_empty() {
+                "No errors".to_string()
+            } else {
+                // Errors take priority over warnings for the headline
+                // diagnostic shown alongside the count.
+                let headline = diagnostics
+                    .iter()
+                    .filter(|d| d.severity == check::Severity::Error)
+                    .chain(diagnostics.iter())
+                    .next()
+                    .expect("diagnostics is non-empty");
+                format!(
+                    "{errors} error(s), {warnings} warning(s) — Ln {}: {} {}",
+                    headline.line + 1,
+                    headline.code,
+                    headline.message
+                )
+            };
+            editor.status_is_error = errors > 0;
+            editor.set_diagnostics(diagnostics);
+        }
+        CheckMessage::ToolMissing => {
+            editor.status_message =
+                "dotnet not found — install .NET SDK for Ctrl+S diagnostics".to_string();
+            editor.status_is_error = true;
+        }
+        CheckMessage::Failed(e) => {
+            editor.status_message = format!("Check failed: {e}");
+            editor.status_is_error = true;
         }
     }
 }

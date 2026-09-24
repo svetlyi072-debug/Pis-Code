@@ -1,3 +1,4 @@
+use crate::check::Diagnostic;
 use crate::file_io;
 use anyhow::Result;
 use std::ops::Range;
@@ -80,6 +81,10 @@ pub struct Editor {
     pub selection_anchor: Option<(usize, usize)>,
     clipboard: String,
 
+    /// Compiler diagnostics from the last Ctrl+S check, kept until the
+    /// next check completes.
+    pub diagnostics: Vec<Diagnostic>,
+
     desired_col: usize,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
@@ -104,6 +109,7 @@ impl Editor {
             status_is_error: false,
             selection_anchor: None,
             clipboard: String::new(),
+            diagnostics: Vec::new(),
             desired_col: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -923,19 +929,32 @@ impl Editor {
 
     // ---- persistence ----
 
-    pub fn save(&mut self) {
+    /// Returns `true` if the save succeeded.
+    pub fn save(&mut self) -> bool {
         match file_io::save(&self.file_path, &self.lines) {
             Ok(()) => {
                 self.modified = false;
                 self.confirm_quit = false;
                 self.status_message = format!("Saved {}", self.file_path.display());
                 self.status_is_error = false;
+                true
             }
             Err(e) => {
                 self.status_message = format!("Save failed: {e}");
                 self.status_is_error = true;
+                false
             }
         }
+    }
+
+    // ---- diagnostics (Ctrl+S check) ----
+
+    pub fn diagnostics_for_line(&self, row: usize) -> impl Iterator<Item = &Diagnostic> {
+        self.diagnostics.iter().filter(move |d| d.line == row)
+    }
+
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
+        self.diagnostics = diagnostics;
     }
 }
 
