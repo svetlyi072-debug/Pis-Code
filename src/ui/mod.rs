@@ -86,11 +86,13 @@ pub fn draw(f: &mut Frame, editor: &mut Editor, highlighter: &Highlighter) {
 fn draw_status(f: &mut Frame, area: Rect, editor: &Editor) {
     let modified = if editor.modified { " [+]" } else { "" };
     let left = format!(
-        " {}{}  Ln {}, Col {}",
+        " {}{}  Ln {}, Col {}  {} chars, {} lines",
         editor.file_path.display(),
         modified,
         editor.cursor_row + 1,
-        editor.cursor_col + 1
+        editor.cursor_col + 1,
+        editor.char_count(),
+        editor.line_count()
     );
     let right = editor.status_message.clone();
 

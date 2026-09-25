@@ -121,6 +121,12 @@ impl Editor {
         self.lines.len()
     }
 
+    /// Total character count across the whole buffer (not counting line
+    /// terminators).
+    pub fn char_count(&self) -> usize {
+        self.lines.iter().map(|l| l.chars().count()).sum()
+    }
+
     fn current_line(&self) -> &str {
         &self.lines[self.cursor_row]
     }
@@ -1219,6 +1225,16 @@ mod tests {
         ed.insert_tab();
         assert_eq!(ed.lines[0], "    ");
         assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn char_count_sums_all_lines_excluding_line_terminators() {
+        let mut ed = new_editor();
+        assert_eq!(ed.char_count(), 0);
+        type_str(&mut ed, "abc");
+        ed.newline();
+        type_str(&mut ed, "de");
+        assert_eq!(ed.char_count(), 5); // "abc" + "de", newline not counted
     }
 
     #[test]
