@@ -1,4 +1,5 @@
 use ratatui::style::{Color, Modifier, Style as RtStyle};
+use std::path::Path;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SynStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -10,7 +11,9 @@ pub struct Highlighter {
 }
 
 impl Highlighter {
-    pub fn new() -> Self {
+    /// Picks the syntax definition by the file's extension, falling back
+    /// to plain text for anything unrecognized.
+    pub fn new(path: &Path) -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set
@@ -18,9 +21,19 @@ impl Highlighter {
             .get("base16-ocean.dark")
             .cloned()
             .unwrap_or_else(|| theme_set.themes.values().next().unwrap().clone());
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        // syntect's bundled grammars key JS/TS variants under "js", and
+        // have no GDScript grammar at all — Python's is a reasonable
+        // stand-in (comments, strings and numbers still highlight
+        // correctly; GDScript's own keywords just won't be colored).
+        let lookup_ext = match ext {
+            "mjs" | "cjs" | "jsx" => "js",
+            "gd" => "py",
+            other => other,
+        };
         let syntax = syntax_set
-            .find_syntax_by_extension("cs")
-            .or_else(|| syntax_set.find_syntax_by_name("C#"))
+            .find_syntax_by_extension(lookup_ext)
             .cloned()
             .unwrap_or_else(|| syntax_set.find_syntax_plain_text().clone());
 

@@ -45,7 +45,12 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
                 && (m.contains(KeyModifiers::SHIFT) || c == 'S') =>
         {
             if editor.save() {
-                return Action::TriggerCheck;
+                if editor.language == crate::editor::Language::Other {
+                    editor.status_message = "Saved (no checker for this file type)".to_string();
+                    editor.status_is_error = false;
+                } else {
+                    return Action::TriggerCheck;
+                }
             }
         }
         (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
@@ -78,6 +83,7 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
         (KeyCode::Delete, m) if m.contains(KeyModifiers::CONTROL) => editor.delete_word_forward(),
         (KeyCode::Delete, _) => editor.delete_forward(),
         (KeyCode::Tab, _) => editor.insert_tab(),
+        (KeyCode::BackTab, _) => editor.dedent(),
 
         (KeyCode::Left, m)
             if m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT) =>

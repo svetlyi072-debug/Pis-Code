@@ -25,6 +25,54 @@ enum CharClass {
     Other,
 }
 
+/// Drives per-language smart-editing behavior: whether Enter between an
+/// autoclosed `{`/`}` pair does the Allman-style block split, whether a
+/// trailing `:` also deepens indent (Python-style block syntax), and
+/// whether `'` autocloses (disabled for Rust, where it's used constantly
+/// for lifetimes like `&'a str` and autoclosing it there is more
+/// nuisance than help).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    CSharp,
+    JavaScript,
+    Rust,
+    Python,
+    GdScript,
+    Other,
+}
+
+impl Language {
+    fn from_path(path: &std::path::Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("cs") => Language::CSharp,
+            Some("js" | "mjs" | "cjs" | "jsx") => Language::JavaScript,
+            Some("rs") => Language::Rust,
+            Some("py" | "py3" | "pyw" | "pyi") => Language::Python,
+            Some("gd") => Language::GdScript,
+            _ => Language::Other,
+        }
+    }
+
+    /// `{}` is a block in C#, JavaScript and Rust, so Enter between an
+    /// autoclosed pair splits it Allman-style. In Python/GDScript `{}` is
+    /// just a dict/set literal — no split, only the generic
+    /// deepen-if-open-bracket rule applies there.
+    fn allman_brace_split(self) -> bool {
+        matches!(
+            self,
+            Language::CSharp | Language::JavaScript | Language::Rust
+        )
+    }
+
+    fn colon_deepens_indent(self) -> bool {
+        matches!(self, Language::Python | Language::GdScript)
+    }
+
+    fn autocloses_single_quote(self) -> bool {
+        !matches!(self, Language::Rust)
+    }
+}
+
 // The real OS clipboard is global, external, mutable state shared with
 // everything else on the machine — reading/writing it from unit tests
 // would make them flaky (parallel test threads racing on it, or picking up
@@ -66,6 +114,7 @@ pub struct Editor {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub file_path: PathBuf,
+    pub language: Language,
     pub modified: bool,
 
     /// Top-left visible cell, in (line, char) space.
@@ -94,11 +143,13 @@ pub struct Editor {
 impl Editor {
     pub fn open(path: PathBuf) -> Result<Self> {
         let lines = file_io::load_or_create(&path)?;
+        let language = Language::from_path(&path);
         Ok(Self {
             lines,
             cursor_row: 0,
             cursor_col: 0,
             file_path: path,
+            language,
             modified: false,
             scroll: 0,
             col_scroll: 0,
@@ -426,7 +477,14 @@ impl Editor {
                 self.begin_edit(EditGroup::Insert);
                 self.cursor_col += 1;
             }
-            '"' | '\'' => {
+            '\'' if !self.language.autocloses_single_quote() => {
+                // Rust: `'` is used constantly for lifetimes (`&'a str`),
+                // where autoclosing it into `''` is more nuisance than
+                // help, so just insert it plainly there.
+                self.begin_edit(EditGroup::Insert);
+                self.insert_raw(c);
+            }
+            '"' | '\'' | '`' => {
                 self.begin_edit(EditGroup::Insert);
                 if self.char_at_cursor() == Some(c) {
                     // Type over an already-present closing quote.
@@ -450,10 +508,15 @@ impl Editor {
         self.modified = true;
     }
 
+    /// Tab: with an active selection, indents every line the selection
+    /// touches by one level (VS Code-style block indent) instead of
+    /// replacing the selected text. Otherwise inserts spaces at the
+    /// cursor.
     pub fn insert_tab(&mut self) {
         self.confirm_quit = false;
         if self.has_selection() {
-            self.delete_selection_as(EditGroup::Insert);
+            self.indent_selection();
+            return;
         }
         self.begin_edit(EditGroup::Insert);
         for _ in 0..INDENT.len() {
@@ -463,14 +526,101 @@ impl Editor {
         self.modified = true;
     }
 
-    /// Enter key: implements the "smart" C#-block split, Allman-style (the
-    /// way Visual Studio formats C#). If the cursor sits directly between
-    /// `{` and `}`, expand into four lines: the code before `{` stays on
-    /// its own line, the opening brace moves to its own line at the same
-    /// indentation, an empty line one level deeper is inserted for the
-    /// cursor, and the closing brace goes on its own line matching the
-    /// opening brace's indentation. Otherwise, do a normal newline that
-    /// copies (and possibly deepens) the current line's indentation.
+    /// Shift+Tab: with an active selection, dedents every line it
+    /// touches by up to one level; otherwise dedents just the current
+    /// line.
+    pub fn dedent(&mut self) {
+        self.confirm_quit = false;
+        if self.has_selection() {
+            self.dedent_selection();
+        } else {
+            self.dedent_line();
+        }
+    }
+
+    fn selection_line_span(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.selection_bounds()?;
+        Some((start.0, end.0))
+    }
+
+    fn indent_selection(&mut self) {
+        let Some((start_row, end_row)) = self.selection_line_span() else {
+            return;
+        };
+        self.begin_edit(EditGroup::Insert);
+        for row in start_row..=end_row {
+            self.lines[row].insert_str(0, INDENT);
+        }
+        // Every line in range shifted right by the same amount, so both
+        // ends of the selection shift identically regardless of which
+        // row each sits on.
+        self.cursor_col += INDENT.len();
+        if let Some(anchor) = self.selection_anchor.as_mut() {
+            anchor.1 += INDENT.len();
+        }
+        self.desired_col = self.cursor_col;
+        self.modified = true;
+    }
+
+    fn dedent_selection(&mut self) {
+        let Some((start_row, end_row)) = self.selection_line_span() else {
+            return;
+        };
+        self.begin_edit(EditGroup::Delete);
+        let anchor_row = self.selection_anchor.map(|a| a.0);
+        let mut cursor_removed = 0;
+        let mut anchor_removed = 0;
+        for row in start_row..=end_row {
+            let removed = Self::dedent_line_at(&mut self.lines[row]);
+            if row == self.cursor_row {
+                cursor_removed = removed;
+            }
+            if Some(row) == anchor_row {
+                anchor_removed = removed;
+            }
+        }
+        self.cursor_col = self.cursor_col.saturating_sub(cursor_removed);
+        if let Some(anchor) = self.selection_anchor.as_mut() {
+            anchor.1 = anchor.1.saturating_sub(anchor_removed);
+        }
+        self.desired_col = self.cursor_col;
+        self.modified = true;
+    }
+
+    fn dedent_line(&mut self) {
+        self.begin_edit(EditGroup::Delete);
+        let row = self.cursor_row;
+        let removed = Self::dedent_line_at(&mut self.lines[row]);
+        self.cursor_col = self.cursor_col.saturating_sub(removed);
+        self.desired_col = self.cursor_col;
+        self.modified = true;
+    }
+
+    /// Removes up to one indent level of leading spaces from `line`,
+    /// returning how many characters were removed.
+    fn dedent_line_at(line: &mut String) -> usize {
+        let remove = line
+            .chars()
+            .take(INDENT.len())
+            .take_while(|c| *c == ' ')
+            .count();
+        if remove > 0 {
+            let byte_idx = Self::byte_idx(line, remove);
+            line.replace_range(..byte_idx, "");
+        }
+        remove
+    }
+
+    /// Enter key. For languages where `{}` is a block (C#, JavaScript,
+    /// Rust), if the cursor sits directly between an autoclosed `{` and
+    /// `}`, expand Allman-style into four lines — the code before `{`
+    /// stays on its own line, `{` moves to its own line at the same
+    /// indent, an empty line one level deeper is inserted for the cursor,
+    /// and `}` goes on its own line matching `{`'s indent. Other
+    /// languages (`{}` is just a dict/set literal there, not a block) get
+    /// no split at all. Otherwise it's plain autoindent — deepened after
+    /// an unclosed bracket for any language, or after a trailing `:` for
+    /// Python/GDScript's indentation-based blocks.
     pub fn newline(&mut self) {
         self.confirm_quit = false;
         if self.has_selection() {
@@ -485,7 +635,7 @@ impl Editor {
         let before = self.char_before_cursor();
         let after = self.char_at_cursor();
 
-        if before == Some('{') && after == Some('}') {
+        if self.language.allman_brace_split() && before == Some('{') && after == Some('}') {
             let bi = Self::byte_idx(&line, self.cursor_col);
             // `left` ends with the '{' itself since the cursor sits right
             // after it; strip that brace back off to get the code before it.
@@ -508,7 +658,8 @@ impl Editor {
             let trimmed_left = left.trim_end();
             let deepen = trimmed_left.ends_with('{')
                 || trimmed_left.ends_with('(')
-                || trimmed_left.ends_with('[');
+                || trimmed_left.ends_with('[')
+                || (self.language.colon_deepens_indent() && trimmed_left.ends_with(':'));
 
             let new_indent = if deepen {
                 format!("{indent}{INDENT}")
@@ -558,6 +709,7 @@ impl Editor {
                     | (Some('['), Some(']'))
                     | (Some('"'), Some('"'))
                     | (Some('\''), Some('\''))
+                    | (Some('`'), Some('`'))
             );
             if is_pair {
                 let row = self.cursor_row;
@@ -972,6 +1124,14 @@ mod tests {
         Editor::open(PathBuf::from("__test_buffer__.cs")).unwrap()
     }
 
+    fn new_python_editor() -> Editor {
+        Editor::open(PathBuf::from("__test_buffer__.py")).unwrap()
+    }
+
+    fn new_editor_with_ext(ext: &str) -> Editor {
+        Editor::open(PathBuf::from(format!("__test_buffer__.{ext}"))).unwrap()
+    }
+
     fn type_str(ed: &mut Editor, s: &str) {
         for c in s.chars() {
             ed.insert_char(c);
@@ -1352,5 +1512,174 @@ mod tests {
         ed.paste();
         assert_eq!(ed.lines[0], "foo");
         assert_eq!(ed.lines[1], "bar()");
+    }
+
+    // ---- Python language support ----
+
+    #[test]
+    fn python_enter_deepens_after_colon() {
+        let mut ed = new_python_editor();
+        type_str(&mut ed, "def foo():");
+        ed.newline();
+        assert_eq!(ed.lines, vec!["def foo():".to_string(), "    ".to_string()]);
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn python_curly_braces_do_not_allman_split() {
+        // {} in Python is a dict/set literal, not a block — Enter between
+        // an autoclosed pair should just deepen-indent, not explode into
+        // the C#-style four-line Allman split.
+        let mut ed = new_python_editor();
+        type_str(&mut ed, "d = {");
+        assert_eq!(ed.lines[0], "d = {}");
+        ed.newline();
+        assert_eq!(ed.lines, vec!["d = {".to_string(), "    }".to_string()]);
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    // ---- smart Tab / Shift+Tab block indent ----
+
+    #[test]
+    fn tab_indents_full_selected_lines() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "abc");
+        ed.newline();
+        type_str(&mut ed, "def");
+        ed.select_all();
+        ed.insert_tab();
+        assert_eq!(ed.lines, vec!["    abc".to_string(), "    def".to_string()]);
+        assert_eq!(ed.cursor_col, 7);
+        assert!(ed.has_selection());
+    }
+
+    #[test]
+    fn shift_tab_dedents_selected_lines() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "    abc");
+        ed.newline();
+        type_str(&mut ed, "def");
+        ed.select_all();
+        ed.dedent();
+        assert_eq!(ed.lines, vec!["abc".to_string(), "def".to_string()]);
+        assert_eq!(ed.cursor_col, 3);
+    }
+
+    #[test]
+    fn dedent_line_without_selection_removes_up_to_one_indent_level() {
+        let mut ed = new_editor();
+        type_str(&mut ed, "      abc"); // 6 leading spaces
+        ed.move_home();
+        ed.dedent();
+        assert_eq!(ed.lines[0], "  abc"); // only one 4-space level removed
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    // ---- JavaScript / Rust: Allman brace split, same as C# ----
+
+    #[test]
+    fn javascript_enter_uses_allman_split() {
+        let mut ed = new_editor_with_ext("js");
+        type_str(&mut ed, "function foo() {");
+        assert_eq!(ed.lines[0], "function foo() {}");
+        ed.newline();
+        assert_eq!(
+            ed.lines,
+            vec![
+                "function foo()".to_string(),
+                "{".to_string(),
+                "    ".to_string(),
+                "}".to_string(),
+            ]
+        );
+        assert_eq!(ed.cursor_row, 2);
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn rust_enter_uses_allman_split() {
+        let mut ed = new_editor_with_ext("rs");
+        type_str(&mut ed, "fn foo() {");
+        assert_eq!(ed.lines[0], "fn foo() {}");
+        ed.newline();
+        assert_eq!(
+            ed.lines,
+            vec![
+                "fn foo()".to_string(),
+                "{".to_string(),
+                "    ".to_string(),
+                "}".to_string()
+            ]
+        );
+        assert_eq!(ed.cursor_row, 2);
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn rust_single_quote_does_not_autoclose() {
+        // Rust uses `'` constantly for lifetimes (`&'a str`); autoclosing
+        // it into `''` would get in the way, so it should insert plainly.
+        let mut ed = new_editor_with_ext("rs");
+        type_str(&mut ed, "&'a str");
+        assert_eq!(ed.lines[0], "&'a str");
+        assert_eq!(ed.cursor_col, 7);
+    }
+
+    #[test]
+    fn other_languages_still_autoclose_single_quote() {
+        let mut ed = new_editor_with_ext("py");
+        ed.insert_char('\'');
+        assert_eq!(ed.lines[0], "''");
+        assert_eq!(ed.cursor_col, 1);
+    }
+
+    // ---- backtick (template literal) pairing, any language ----
+
+    #[test]
+    fn backtick_autocloses_and_types_over() {
+        let mut ed = new_editor_with_ext("js");
+        ed.insert_char('`');
+        assert_eq!(ed.lines[0], "``");
+        assert_eq!(ed.cursor_col, 1);
+        ed.insert_char('`');
+        assert_eq!(ed.lines[0], "``");
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn backspace_deletes_empty_backtick_pair_as_unit() {
+        let mut ed = new_editor_with_ext("js");
+        ed.insert_char('`');
+        ed.backspace();
+        assert_eq!(ed.lines[0], "");
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    // ---- GDScript: Python-style colon blocks, no brace split ----
+
+    #[test]
+    fn gdscript_enter_deepens_after_colon() {
+        let mut ed = new_editor_with_ext("gd");
+        type_str(&mut ed, "func _ready():");
+        ed.newline();
+        assert_eq!(
+            ed.lines,
+            vec!["func _ready():".to_string(), "    ".to_string()]
+        );
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn gdscript_curly_braces_do_not_split() {
+        let mut ed = new_editor_with_ext("gd");
+        type_str(&mut ed, "var d = {");
+        assert_eq!(ed.lines[0], "var d = {}");
+        ed.newline();
+        assert_eq!(ed.lines, vec!["var d = {".to_string(), "    }".to_string()]);
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 4);
     }
 }

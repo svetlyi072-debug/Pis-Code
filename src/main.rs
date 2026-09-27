@@ -39,8 +39,8 @@ fn main() -> Result<()> {
         }
     };
 
+    let highlighter = Highlighter::new(&path);
     let mut editor = Editor::open(path).context("failed to open file")?;
-    let highlighter = Highlighter::new();
 
     install_panic_restore_hook();
 
@@ -99,7 +99,7 @@ fn run_app<B: Backend>(
                             input::Action::Quit => return Ok(()),
                             input::Action::Continue => {}
                             input::Action::TriggerCheck => {
-                                if checker.start(editor.file_path.clone()) {
+                                if checker.start(editor.file_path.clone(), editor.language) {
                                     editor.status_message = "Checking…".to_string();
                                     editor.status_is_error = false;
                                 }
@@ -141,19 +141,23 @@ fn apply_check_message(editor: &mut Editor, msg: CheckMessage) {
                     .chain(diagnostics.iter())
                     .next()
                     .expect("diagnostics is non-empty");
+                let code_prefix = if headline.code.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", headline.code)
+                };
                 format!(
-                    "{errors} error(s), {warnings} warning(s) — Ln {}: {} {}",
+                    "{errors} error(s), {warnings} warning(s) — Ln {}: {code_prefix}{}",
                     headline.line + 1,
-                    headline.code,
                     headline.message
                 )
             };
             editor.status_is_error = errors > 0;
             editor.set_diagnostics(diagnostics);
         }
-        CheckMessage::ToolMissing => {
+        CheckMessage::ToolMissing(tool) => {
             editor.status_message =
-                "dotnet not found — install .NET SDK for Ctrl+S diagnostics".to_string();
+                format!("{tool} not found — install it to enable checks for this language");
             editor.status_is_error = true;
         }
         CheckMessage::Failed(e) => {
