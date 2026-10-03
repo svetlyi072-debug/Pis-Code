@@ -1,60 +1,65 @@
+use crate::editor::Language;
 use ratatui::style::{Color, Modifier, Style as RtStyle};
 use std::path::Path;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SynStyle, Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder};
 
+/// Syntax highlighting for the languages Pis Code knows (C#, JavaScript,
+/// Rust, Python, GDScript). Any other file type is deliberately left
+/// unstyled so its text renders in the terminal's own configured colors
+/// instead of a fixed theme foreground.
 pub struct Highlighter {
+    /// `None` means plain: no styling at all.
+    backend: Option<SyntectBackend>,
+}
+
+struct SyntectBackend {
     syntax_set: SyntaxSet,
     theme: Theme,
     syntax: SyntaxReference,
 }
 
 impl Highlighter {
-    /// Picks the syntax definition by the file's extension, falling back
-    /// to plain text for anything unrecognized.
     pub fn new(path: &Path) -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
-        let theme_set = ThemeSet::load_defaults();
-        let theme = theme_set
-            .themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .unwrap_or_else(|| theme_set.themes.values().next().unwrap().clone());
-
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        // syntect's bundled grammars key JS/TS variants under "js", and
-        // have no GDScript grammar at all — Python's is a reasonable
-        // stand-in (comments, strings and numbers still highlight
-        // correctly; GDScript's own keywords just won't be colored).
-        let lookup_ext = match ext {
-            "mjs" | "cjs" | "jsx" => "js",
-            "gd" => "py",
-            other => other,
+        let backend = match Language::from_path(path) {
+            Language::Other => None,
+            // syntect's bundled grammars have no GDScript, so it ships its
+            // own (gdscript.sublime-syntax) in a set of its own.
+            Language::GdScript => Some(SyntectBackend::gdscript()),
+            Language::CSharp => Some(SyntectBackend::bundled("cs")),
+            Language::JavaScript => Some(SyntectBackend::bundled("js")),
+            Language::Rust => Some(SyntectBackend::bundled("rs")),
+            Language::Python => Some(SyntectBackend::bundled("py")),
         };
-        let syntax = syntax_set
-            .find_syntax_by_extension(lookup_ext)
-            .cloned()
-            .unwrap_or_else(|| syntax_set.find_syntax_plain_text().clone());
-
-        Self {
-            syntax_set,
-            theme,
-            syntax,
-        }
+        Self { backend }
     }
 
     /// Highlight `lines[0..upto]` from the start of the buffer so
     /// multi-line constructs (block comments, verbatim strings) stay
     /// consistent, and return styled spans per line.
     pub fn highlight(&self, lines: &[String], upto: usize) -> Vec<Vec<(RtStyle, String)>> {
-        let mut h = HighlightLines::new(&self.syntax, &self.theme);
         let upto = upto.min(lines.len());
+
+        let Some(backend) = &self.backend else {
+            return lines[..upto]
+                .iter()
+                .map(|line| {
+                    if line.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![(RtStyle::default(), line.clone())]
+                    }
+                })
+                .collect();
+        };
+
+        let mut h = HighlightLines::new(&backend.syntax, &backend.theme);
         let mut out = Vec::with_capacity(upto);
         for line in &lines[..upto] {
             let with_nl = format!("{line}\n");
             let ranges: Vec<(SynStyle, &str)> = h
-                .highlight_line(&with_nl, &self.syntax_set)
+                .highlight_line(&with_nl, &backend.syntax_set)
                 .unwrap_or_default();
             let spans = ranges
                 .into_iter()
@@ -72,6 +77,48 @@ impl Highlighter {
     }
 }
 
+impl SyntectBackend {
+    fn theme() -> Theme {
+        let theme_set = ThemeSet::load_defaults();
+        theme_set
+            .themes
+            .get("base16-ocean.dark")
+            .cloned()
+            .unwrap_or_else(|| theme_set.themes.values().next().unwrap().clone())
+    }
+
+    fn bundled(extension: &str) -> Self {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let syntax = syntax_set
+            .find_syntax_by_extension(extension)
+            .cloned()
+            .unwrap_or_else(|| syntax_set.find_syntax_plain_text().clone());
+        Self {
+            syntax_set,
+            theme: Self::theme(),
+            syntax,
+        }
+    }
+
+    fn gdscript() -> Self {
+        let definition =
+            SyntaxDefinition::load_from_str(include_str!("gdscript.sublime-syntax"), true, None)
+                .expect("bundled GDScript grammar is valid");
+        let mut builder = SyntaxSetBuilder::new();
+        builder.add(definition);
+        let syntax_set = builder.build();
+        let syntax = syntax_set
+            .find_syntax_by_extension("gd")
+            .cloned()
+            .expect("GDScript grammar registers the .gd extension");
+        Self {
+            syntax_set,
+            theme: Self::theme(),
+            syntax,
+        }
+    }
+}
+
 fn to_ratatui_style(style: SynStyle) -> RtStyle {
     let fg = style.foreground;
     let mut rt = RtStyle::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
@@ -85,4 +132,154 @@ fn to_ratatui_style(style: SynStyle) -> RtStyle {
         rt = rt.add_modifier(Modifier::UNDERLINED);
     }
     rt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spans_for(path: &str, source: &str) -> Vec<Vec<(RtStyle, String)>> {
+        let lines: Vec<String> = source.lines().map(String::from).collect();
+        Highlighter::new(Path::new(path)).highlight(&lines, lines.len())
+    }
+
+    /// The foreground color of the first span whose text, ignoring the
+    /// whitespace syntect merges into neighboring same-colored spans, is
+    /// exactly `text`.
+    fn fg_of(row: &[(RtStyle, String)], text: &str) -> Option<Color> {
+        row.iter()
+            .find(|(_, t)| t.trim() == text)
+            .and_then(|(s, _)| s.fg)
+    }
+
+    #[test]
+    fn unsupported_file_types_are_unstyled_so_terminal_colors_apply() {
+        for path in ["notes.txt", "data.json", "README.md", "Makefile"] {
+            let rows = spans_for(path, "hello world 123 \"quoted\"");
+            assert_eq!(rows.len(), 1, "{path}");
+            for (style, _) in &rows[0] {
+                assert_eq!(*style, RtStyle::default(), "{path} must not set colors");
+            }
+            let joined: String = rows[0].iter().map(|(_, t)| t.as_str()).collect();
+            assert_eq!(joined, "hello world 123 \"quoted\"", "{path}");
+        }
+    }
+
+    #[test]
+    fn supported_languages_are_still_colored() {
+        for (path, source) in [
+            ("a.cs", "using System;"),
+            ("a.js", "const x = 1;"),
+            ("a.rs", "fn main() {}"),
+            ("a.py", "def f(): pass"),
+            ("a.gd", "func _ready():"),
+        ] {
+            let rows = spans_for(path, source);
+            assert!(
+                rows[0].iter().any(|(s, _)| s.fg.is_some()),
+                "{path} should have colored spans"
+            );
+        }
+    }
+
+    #[test]
+    fn gdscript_grammar_loads_and_every_context_compiles() {
+        // Touches every context in the grammar (comments, all four string
+        // kinds + escapes + placeholders, annotations, declarations,
+        // keywords, constants, every number form, node paths, types,
+        // calls, operators), so a bad regex anywhere surfaces here rather
+        // than as a panic while someone is typing.
+        let source = r#"@tool
+@export_range(0, 10) var speed: float = 1.5e3
+class_name Player extends CharacterBody2D
+signal died(reason)
+enum State { IDLE, RUN }
+const MAX_HP := 0xFF
+var mask = 0b1010 + .5 + 1_000
+# a comment
+func _ready() -> void:
+	var s = "esc\n %s %d" % ["a", 1]
+	var t = 'single \' quote'
+	var n = &"name"
+	var raw = r"C:\raw"
+	var path = $"Sprite/Child"
+	var label = %Unique
+	var body = $Body/Collision
+	var v = Vector2(1, 2) * 3
+	if x and not y or z in w:
+		return null
+	"""
+	triple
+	"""
+	'''
+	triple single
+	'''
+"#;
+        let rows = spans_for("player.gd", source);
+        assert!(rows.len() > 20);
+    }
+
+    #[test]
+    fn gdscript_scopes_get_distinct_colors() {
+        let rows = spans_for(
+            "a.gd",
+            "func _ready():\n\tvar speed = 10\n\treturn \"s\" # c\nextends Node2D\n@export var x\nsignal hit\nvar y = true",
+        );
+        let default = fg_of(&rows[1], "speed").expect("plain identifier has a color");
+
+        // Every one of these should differ from plain-identifier color.
+        for (row, text, what) in [
+            (0, "func", "func keyword"),
+            (0, "_ready", "function name"),
+            (1, "var", "var keyword"),
+            (1, "10", "number"),
+            (2, "return", "control keyword"),
+            (2, "s", "string contents"),
+            (3, "extends", "extends"),
+            (3, "Node2D", "class name"),
+            (4, "@export", "annotation"),
+            (5, "signal", "signal keyword"),
+            (6, "true", "constant"),
+        ] {
+            let c = fg_of(&rows[row], text)
+                .unwrap_or_else(|| panic!("no span for {what}: {text:?} in {:?}", rows[row]));
+            assert_ne!(
+                c, default,
+                "{what} ({text:?}) should not be the plain color"
+            );
+        }
+        // Comments get their own color too.
+        assert!(rows[2]
+            .iter()
+            .any(|(s, t)| t.contains("# c") && s.fg.is_some() && s.fg != Some(default)));
+    }
+
+    #[test]
+    fn gdscript_comment_hides_keywords_and_strings_hide_comments() {
+        let rows = spans_for("a.gd", "# func var if\nvar s = \"# not a comment\"");
+
+        // The commented-out keywords are one comment span, not
+        // individually keyword-colored.
+        assert_eq!(rows[0].len(), 1, "{:?}", rows[0]);
+        let comment_color = rows[0][0].0.fg;
+
+        // The `#` inside a string is colored as string content, not as a
+        // comment.
+        let in_string = rows[1]
+            .iter()
+            .find(|(_, t)| t.contains("not a comment"))
+            .expect("string content span");
+        assert_ne!(in_string.0.fg, comment_color);
+    }
+
+    #[test]
+    fn gdscript_unterminated_string_does_not_swallow_following_lines() {
+        let rows = spans_for("a.gd", "var s = \"oops\nfunc f():\n\tpass");
+        let default = Highlighter::new(Path::new("a.gd")).highlight(&["x".to_string()], 1)[0][0]
+            .0
+            .fg;
+        // Line 2's `func` is still a keyword (colored, not default).
+        let func = fg_of(&rows[1], "func").expect("func span");
+        assert_ne!(Some(func), default);
+    }
 }

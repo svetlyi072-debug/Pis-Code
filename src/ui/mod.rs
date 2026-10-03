@@ -1,5 +1,5 @@
 use crate::check::Severity;
-use crate::editor::Editor;
+use crate::editor::{display_columns, Editor, TAB_WIDTH};
 use crate::syntax::Highlighter;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -49,13 +49,28 @@ pub fn draw(f: &mut Frame, editor: &mut Editor, highlighter: &Highlighter) {
         let mut spans = vec![Span::styled(num, Style::default().fg(gutter_color))];
 
         if let Some(row_spans) = highlighted.get(file_row) {
-            let visible = slice_spans(row_spans, editor.col_scroll, content_width);
-            let sel = editor.selection_col_range(file_row);
+            // Everything below works in screen cells, not characters:
+            // tabs are shown as spaces up to the next tab stop, so a
+            // character's index no longer equals its on-screen column.
+            let line = &editor.lines[file_row];
+            let cols = display_columns(line);
+            let last = cols.len() - 1;
+            let to_cell = |char_idx: usize| cols[char_idx.min(last)];
+
+            let expanded = expand_tabs(row_spans);
+            let visible = slice_spans(&expanded, editor.col_scroll, content_width);
+
+            let sel = editor
+                .selection_col_range(file_row)
+                .map(|r| to_cell(r.start)..to_cell(r.end));
             let with_selection = apply_selection(visible, editor.col_scroll, sel);
 
-            let line_char_len = editor.lines[file_row].chars().count();
-            let severities =
-                diagnostic_severity_map(editor.diagnostics_for_line(file_row), line_char_len);
+            let line_char_len = line.chars().count();
+            let severities: HashMap<usize, Severity> =
+                diagnostic_severity_map(editor.diagnostics_for_line(file_row), line_char_len)
+                    .into_iter()
+                    .map(|(char_idx, sev)| (to_cell(char_idx), sev))
+                    .collect();
             spans.extend(apply_diagnostics(
                 with_selection,
                 editor.col_scroll,
@@ -75,7 +90,7 @@ pub fn draw(f: &mut Frame, editor: &mut Editor, highlighter: &Highlighter) {
     draw_status(f, status_area, editor);
 
     let cursor_screen_row = editor.cursor_row - editor.scroll;
-    let cursor_screen_col = gutter_width + (editor.cursor_col - editor.col_scroll);
+    let cursor_screen_col = gutter_width + (editor.cursor_display_col() - editor.col_scroll);
     let cx = text_area.x + cursor_screen_col as u16;
     let cy = text_area.y + cursor_screen_row as u16;
     if cx < text_area.x + text_area.width && cy < text_area.y + text_area.height {
@@ -132,6 +147,30 @@ fn draw_status(f: &mut Frame, area: Rect, editor: &Editor) {
 
     let paragraph = Paragraph::new(Line::from(Span::styled(text, style))).style(style);
     f.render_widget(paragraph, area);
+}
+
+/// Replaces each tab with the spaces that reach the next tab stop, so the
+/// terminal never sees a raw `\t` (whose width it, and ratatui's diffing,
+/// would otherwise disagree about).
+fn expand_tabs(spans: &[(Style, String)]) -> Vec<(Style, String)> {
+    let mut col = 0usize;
+    spans
+        .iter()
+        .map(|(style, text)| {
+            let mut out = String::with_capacity(text.len());
+            for ch in text.chars() {
+                if ch == '\t' {
+                    let n = TAB_WIDTH - col % TAB_WIDTH;
+                    out.push_str(&" ".repeat(n));
+                    col += n;
+                } else {
+                    out.push(ch);
+                    col += 1;
+                }
+            }
+            (*style, out)
+        })
+        .collect()
 }
 
 /// Slice a highlighted line's spans to the visible window

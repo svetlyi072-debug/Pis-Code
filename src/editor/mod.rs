@@ -4,7 +4,55 @@ use anyhow::Result;
 use std::ops::Range;
 use std::path::PathBuf;
 
-const INDENT: &str = "    ";
+/// Width of a tab character on screen. Display only: the buffer keeps a
+/// real `\t`, the renderer shows it as spaces up to the next tab stop.
+pub const TAB_WIDTH: usize = 4;
+
+/// Indent unit used when the file doesn't show one yet (an empty file, or
+/// one with no indented lines). GDScript's style guide — and Godot's own
+/// editor — indents with tabs, and mixing tabs and spaces is a parse error
+/// there, so a new `.gd` file starts out tab-indented.
+fn default_indent(language: Language) -> &'static str {
+    if language == Language::GdScript {
+        "\t"
+    } else {
+        "    "
+    }
+}
+
+/// Picks the indent unit from the file's own content: the first line that
+/// starts with a tab means tabs; the first non-blank line starting with
+/// two or more spaces means spaces. (A single leading space is ignored —
+/// that's usually the ` * ` of a block comment, not indentation.)
+fn detect_indent(lines: &[String], language: Language) -> String {
+    for line in lines {
+        if line.starts_with('\t') {
+            return "\t".to_string();
+        }
+        if line.starts_with("  ") && !line.trim().is_empty() {
+            return "    ".to_string();
+        }
+    }
+    default_indent(language).to_string()
+}
+
+/// Screen column (in cells) at which each character of `line` starts, plus
+/// one final entry for the line's total width, expanding tabs to the next
+/// multiple of [`TAB_WIDTH`].
+pub fn display_columns(line: &str) -> Vec<usize> {
+    let mut cols = Vec::with_capacity(line.len() + 1);
+    let mut col = 0;
+    for ch in line.chars() {
+        cols.push(col);
+        col += if ch == '\t' {
+            TAB_WIDTH - col % TAB_WIDTH
+        } else {
+            1
+        };
+    }
+    cols.push(col);
+    cols
+}
 
 /// What kind of edit was last performed, used to decide whether a new
 /// keystroke should be coalesced into the current undo step or start a
@@ -42,7 +90,7 @@ pub enum Language {
 }
 
 impl Language {
-    fn from_path(path: &std::path::Path) -> Self {
+    pub(crate) fn from_path(path: &std::path::Path) -> Self {
         match path.extension().and_then(|e| e.to_str()) {
             Some("cs") => Language::CSharp,
             Some("js" | "mjs" | "cjs" | "jsx") => Language::JavaScript,
@@ -115,6 +163,8 @@ pub struct Editor {
     pub cursor_col: usize,
     pub file_path: PathBuf,
     pub language: Language,
+    /// One level of indentation: a tab or four spaces, see [`detect_indent`].
+    indent: String,
     pub modified: bool,
 
     /// Top-left visible cell, in (line, char) space.
@@ -144,12 +194,14 @@ impl Editor {
     pub fn open(path: PathBuf) -> Result<Self> {
         let lines = file_io::load_or_create(&path)?;
         let language = Language::from_path(&path);
+        let indent = detect_indent(&lines, language);
         Ok(Self {
             lines,
             cursor_row: 0,
             cursor_col: 0,
             file_path: path,
             language,
+            indent,
             modified: false,
             scroll: 0,
             col_scroll: 0,
@@ -510,8 +562,8 @@ impl Editor {
 
     /// Tab: with an active selection, indents every line the selection
     /// touches by one level (VS Code-style block indent) instead of
-    /// replacing the selected text. Otherwise inserts spaces at the
-    /// cursor.
+    /// replacing the selected text. Otherwise inserts one indent unit
+    /// (a tab, or four spaces) at the cursor.
     pub fn insert_tab(&mut self) {
         self.confirm_quit = false;
         if self.has_selection() {
@@ -519,8 +571,8 @@ impl Editor {
             return;
         }
         self.begin_edit(EditGroup::Insert);
-        for _ in 0..INDENT.len() {
-            self.insert_raw(' ');
+        for c in self.indent.clone().chars() {
+            self.insert_raw(c);
         }
         self.desired_col = self.cursor_col;
         self.modified = true;
@@ -548,15 +600,16 @@ impl Editor {
             return;
         };
         self.begin_edit(EditGroup::Insert);
+        let unit_chars = self.indent.chars().count();
         for row in start_row..=end_row {
-            self.lines[row].insert_str(0, INDENT);
+            self.lines[row].insert_str(0, &self.indent);
         }
         // Every line in range shifted right by the same amount, so both
         // ends of the selection shift identically regardless of which
         // row each sits on.
-        self.cursor_col += INDENT.len();
+        self.cursor_col += unit_chars;
         if let Some(anchor) = self.selection_anchor.as_mut() {
-            anchor.1 += INDENT.len();
+            anchor.1 += unit_chars;
         }
         self.desired_col = self.cursor_col;
         self.modified = true;
@@ -596,14 +649,19 @@ impl Editor {
         self.modified = true;
     }
 
-    /// Removes up to one indent level of leading spaces from `line`,
-    /// returning how many characters were removed.
+    /// Removes one indent level from the start of `line` — a leading tab,
+    /// or up to four leading spaces, whichever the line actually uses, so
+    /// Shift+Tab works on lines regardless of the file's dominant style.
+    /// Returns how many characters were removed.
     fn dedent_line_at(line: &mut String) -> usize {
-        let remove = line
-            .chars()
-            .take(INDENT.len())
-            .take_while(|c| *c == ' ')
-            .count();
+        let remove = if line.starts_with('\t') {
+            1
+        } else {
+            line.chars()
+                .take(TAB_WIDTH)
+                .take_while(|c| *c == ' ')
+                .count()
+        };
         if remove > 0 {
             let byte_idx = Self::byte_idx(line, remove);
             line.replace_range(..byte_idx, "");
@@ -641,7 +699,7 @@ impl Editor {
             // after it; strip that brace back off to get the code before it.
             let before_brace = line[..bi - 1].trim_end().to_string();
             let right = line[bi..].to_string();
-            let inner_indent = format!("{indent}{INDENT}");
+            let inner_indent = format!("{indent}{}", self.indent);
 
             self.lines[row] = before_brace;
             self.lines.insert(row + 1, format!("{indent}{{"));
@@ -662,7 +720,7 @@ impl Editor {
                 || (self.language.colon_deepens_indent() && trimmed_left.ends_with(':'));
 
             let new_indent = if deepen {
-                format!("{indent}{INDENT}")
+                format!("{indent}{}", self.indent)
             } else {
                 indent
             };
@@ -1068,6 +1126,15 @@ impl Editor {
         self.status_is_error = false;
     }
 
+    /// The cursor's horizontal position in screen cells, i.e. with tabs
+    /// before it expanded (`cursor_col` itself counts characters).
+    pub fn cursor_display_col(&self) -> usize {
+        let cols = display_columns(self.current_line());
+        cols[self.cursor_col.min(cols.len() - 1)]
+    }
+
+    /// Scrolls so the cursor is on screen. `col_scroll` is in screen
+    /// cells (not characters), so tab-indented lines scroll correctly.
     pub fn ensure_visible(&mut self, width: usize, height: usize) {
         if height > 0 {
             if self.cursor_row < self.scroll {
@@ -1077,10 +1144,11 @@ impl Editor {
             }
         }
         if width > 0 {
-            if self.cursor_col < self.col_scroll {
-                self.col_scroll = self.cursor_col;
-            } else if self.cursor_col >= self.col_scroll + width {
-                self.col_scroll = self.cursor_col + 1 - width;
+            let col = self.cursor_display_col();
+            if col < self.col_scroll {
+                self.col_scroll = col;
+            } else if col >= self.col_scroll + width {
+                self.col_scroll = col + 1 - width;
             }
         }
     }
@@ -1660,16 +1728,18 @@ mod tests {
     // ---- GDScript: Python-style colon blocks, no brace split ----
 
     #[test]
-    fn gdscript_enter_deepens_after_colon() {
+    fn gdscript_enter_deepens_after_colon_with_a_tab() {
+        // New .gd files are tab-indented (Godot's own style, and mixing
+        // tabs with spaces is a parse error there).
         let mut ed = new_editor_with_ext("gd");
         type_str(&mut ed, "func _ready():");
         ed.newline();
         assert_eq!(
             ed.lines,
-            vec!["func _ready():".to_string(), "    ".to_string()]
+            vec!["func _ready():".to_string(), "\t".to_string()]
         );
         assert_eq!(ed.cursor_row, 1);
-        assert_eq!(ed.cursor_col, 4);
+        assert_eq!(ed.cursor_col, 1);
     }
 
     #[test]
@@ -1678,8 +1748,110 @@ mod tests {
         type_str(&mut ed, "var d = {");
         assert_eq!(ed.lines[0], "var d = {}");
         ed.newline();
-        assert_eq!(ed.lines, vec!["var d = {".to_string(), "    }".to_string()]);
+        assert_eq!(ed.lines, vec!["var d = {".to_string(), "\t}".to_string()]);
         assert_eq!(ed.cursor_row, 1);
-        assert_eq!(ed.cursor_col, 4);
+        assert_eq!(ed.cursor_col, 1);
+    }
+
+    // ---- tabs: indent style detection, display columns ----
+
+    /// An editor for `__test_buffer__.<ext>` holding `lines`, with the
+    /// indent style detected from them as `Editor::open` would.
+    fn editor_with_lines(ext: &str, lines: &[&str]) -> Editor {
+        let mut ed = new_editor_with_ext(ext);
+        ed.lines = lines.iter().map(|l| l.to_string()).collect();
+        ed.indent = detect_indent(&ed.lines, ed.language);
+        ed
+    }
+
+    #[test]
+    fn indent_style_follows_the_file_when_it_has_one() {
+        assert_eq!(
+            editor_with_lines("cs", &["class A", "{", "\tint x;"]).indent,
+            "\t"
+        );
+        assert_eq!(
+            editor_with_lines("gd", &["func f():", "    pass"]).indent,
+            "    "
+        );
+        // A lone leading space is a block comment's ` * `, not indentation.
+        assert_eq!(
+            editor_with_lines("cs", &["/**", " * doc", " */"]).indent,
+            "    "
+        );
+    }
+
+    #[test]
+    fn indent_style_defaults_by_language_for_empty_files() {
+        assert_eq!(new_editor_with_ext("gd").indent, "\t");
+        assert_eq!(new_editor_with_ext("cs").indent, "    ");
+        assert_eq!(new_editor_with_ext("py").indent, "    ");
+        assert_eq!(new_editor_with_ext("rs").indent, "    ");
+    }
+
+    #[test]
+    fn enter_in_a_tab_indented_file_never_mixes_in_spaces() {
+        let mut ed = editor_with_lines("gd", &["func f():", "\tif x:"]);
+        ed.cursor_row = 1;
+        ed.cursor_col = 6; // end of "\tif x:"
+        ed.newline();
+        assert_eq!(ed.lines[2], "\t\t");
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn tab_key_inserts_the_files_indent_unit() {
+        // Tab-indented file: Tab inserts one real tab character.
+        let mut ed = editor_with_lines("gd", &["\tfirst", "second"]);
+        ed.cursor_row = 1;
+        ed.insert_tab();
+        assert_eq!(ed.lines[1], "\tsecond");
+        assert_eq!(ed.cursor_col, 1);
+
+        // Space-indented file: Tab inserts four spaces.
+        let mut spaces = editor_with_lines("py", &["    first", "second"]);
+        spaces.cursor_row = 1;
+        spaces.insert_tab();
+        assert_eq!(spaces.lines[1], "    second");
+        assert_eq!(spaces.cursor_col, 4);
+    }
+
+    #[test]
+    fn block_indent_and_dedent_use_tabs_in_a_tab_file() {
+        let mut ed = editor_with_lines("gd", &["\ta", "\tb"]);
+        ed.select_all();
+        ed.insert_tab();
+        assert_eq!(ed.lines, vec!["\t\ta".to_string(), "\t\tb".to_string()]);
+        ed.dedent();
+        ed.dedent();
+        assert_eq!(ed.lines, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn display_columns_expand_tabs_to_the_next_tab_stop() {
+        // '\t' at col 0 -> 4 wide, 'a','b' at 4,5, '\t' at 6 -> 2 wide,
+        // 'c' at 8, end at 9.
+        assert_eq!(display_columns("\tab\tc"), vec![0, 4, 5, 6, 8, 9]);
+        assert_eq!(display_columns(""), vec![0]);
+        assert_eq!(display_columns("abc"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn cursor_display_col_accounts_for_tabs_before_it() {
+        let mut ed = editor_with_lines("gd", &["\t\tprint(1)"]);
+        ed.cursor_col = 2; // right after the two tabs
+        assert_eq!(ed.cursor_display_col(), 8);
+        ed.cursor_col = 3; // after the 'p'
+        assert_eq!(ed.cursor_display_col(), 9);
+    }
+
+    #[test]
+    fn horizontal_scroll_is_measured_in_screen_cells() {
+        // 10 tabs = 40 cells wide; cursor at the end must scroll to show
+        // cell 40 even though the line is only 10 characters long.
+        let mut ed = editor_with_lines("gd", &["\t\t\t\t\t\t\t\t\t\t"]);
+        ed.cursor_col = 10;
+        ed.ensure_visible(20, 5);
+        assert_eq!(ed.col_scroll, 40 + 1 - 20);
     }
 }
