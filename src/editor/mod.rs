@@ -1,5 +1,7 @@
 use crate::check::Diagnostic;
 use crate::file_io;
+use crate::language::{BraceSplit, Language};
+use crate::markup;
 use anyhow::Result;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -8,32 +10,33 @@ use std::path::PathBuf;
 /// real `\t`, the renderer shows it as spaces up to the next tab stop.
 pub const TAB_WIDTH: usize = 4;
 
-/// Indent unit used when the file doesn't show one yet (an empty file, or
-/// one with no indented lines). GDScript's style guide — and Godot's own
-/// editor — indents with tabs, and mixing tabs and spaces is a parse error
-/// there, so a new `.gd` file starts out tab-indented.
-fn default_indent(language: Language) -> &'static str {
-    if language == Language::GdScript {
-        "\t"
-    } else {
-        "    "
-    }
-}
-
-/// Picks the indent unit from the file's own content: the first line that
-/// starts with a tab means tabs; the first non-blank line starting with
-/// two or more spaces means spaces. (A single leading space is ignored —
-/// that's usually the ` * ` of a block comment, not indentation.)
+/// Picks the indent unit from the file's own content. The first indented
+/// line decides tabs vs. spaces (a single leading space is ignored — that's
+/// usually the ` * ` of a block comment, not indentation); for spaces, the
+/// narrowest indentation seen is the unit, so a two-space file stays
+/// two-space. Falls back to the language's default for a file with no
+/// indentation yet.
 fn detect_indent(lines: &[String], language: Language) -> String {
-    for line in lines {
-        if line.starts_with('\t') {
-            return "\t".to_string();
-        }
-        if line.starts_with("  ") && !line.trim().is_empty() {
-            return "    ".to_string();
+    let leading_spaces = |l: &String| l.chars().take_while(|c| *c == ' ').count();
+    let is_indented =
+        |l: &String| l.starts_with('\t') || (leading_spaces(l) >= 2 && !l.trim().is_empty());
+
+    match lines.iter().find(|l| is_indented(l)) {
+        None => language.default_indent().to_string(),
+        Some(first) if first.starts_with('\t') && language.allows_tab_indent() => "\t".to_string(),
+        Some(_) => {
+            let narrowest = lines
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .map(leading_spaces)
+                .filter(|&n| n >= 2)
+                .min();
+            match narrowest {
+                Some(n @ (2 | 3 | 4 | 8)) => " ".repeat(n),
+                _ => language.default_indent().to_string(),
+            }
         }
     }
-    default_indent(language).to_string()
 }
 
 /// Screen column (in cells) at which each character of `line` starts, plus
@@ -71,54 +74,6 @@ enum CharClass {
     Whitespace,
     Word,
     Other,
-}
-
-/// Drives per-language smart-editing behavior: whether Enter between an
-/// autoclosed `{`/`}` pair does the Allman-style block split, whether a
-/// trailing `:` also deepens indent (Python-style block syntax), and
-/// whether `'` autocloses (disabled for Rust, where it's used constantly
-/// for lifetimes like `&'a str` and autoclosing it there is more
-/// nuisance than help).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Language {
-    CSharp,
-    JavaScript,
-    Rust,
-    Python,
-    GdScript,
-    Other,
-}
-
-impl Language {
-    pub(crate) fn from_path(path: &std::path::Path) -> Self {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("cs") => Language::CSharp,
-            Some("js" | "mjs" | "cjs" | "jsx") => Language::JavaScript,
-            Some("rs") => Language::Rust,
-            Some("py" | "py3" | "pyw" | "pyi") => Language::Python,
-            Some("gd") => Language::GdScript,
-            _ => Language::Other,
-        }
-    }
-
-    /// `{}` is a block in C#, JavaScript and Rust, so Enter between an
-    /// autoclosed pair splits it Allman-style. In Python/GDScript `{}` is
-    /// just a dict/set literal — no split, only the generic
-    /// deepen-if-open-bracket rule applies there.
-    fn allman_brace_split(self) -> bool {
-        matches!(
-            self,
-            Language::CSharp | Language::JavaScript | Language::Rust
-        )
-    }
-
-    fn colon_deepens_indent(self) -> bool {
-        matches!(self, Language::Python | Language::GdScript)
-    }
-
-    fn autocloses_single_quote(self) -> bool {
-        !matches!(self, Language::Rust)
-    }
 }
 
 // The real OS clipboard is global, external, mutable state shared with
@@ -529,10 +484,26 @@ impl Editor {
                 self.begin_edit(EditGroup::Insert);
                 self.cursor_col += 1;
             }
+            '>' if self.language.auto_closes_tags() => {
+                // HTML/XML: finishing an opening tag inserts its closing
+                // tag after the cursor, leaving the cursor between them.
+                self.begin_edit(EditGroup::Insert);
+                let before: String = self.current_line().chars().take(self.cursor_col).collect();
+                let closing = markup::closing_tag_for(&before, self.language.is_html());
+                self.insert_raw('>');
+                if let Some(closing) = closing {
+                    let between = self.cursor_col;
+                    for ch in closing.chars() {
+                        self.insert_raw(ch);
+                    }
+                    self.cursor_col = between;
+                }
+            }
             '\'' if !self.language.autocloses_single_quote() => {
                 // Rust: `'` is used constantly for lifetimes (`&'a str`),
-                // where autoclosing it into `''` is more nuisance than
-                // help, so just insert it plainly there.
+                // and in Markdown it's an apostrophe — autoclosing it into
+                // `''` there is more nuisance than help, so insert it
+                // plainly.
                 self.begin_edit(EditGroup::Insert);
                 self.insert_raw(c);
             }
@@ -590,6 +561,16 @@ impl Editor {
         }
     }
 
+    /// How many leading spaces one Shift+Tab can remove: the file's indent
+    /// width, or a tab-width's worth when the file is tab-indented.
+    fn dedent_width(&self) -> usize {
+        if self.indent == "\t" {
+            TAB_WIDTH
+        } else {
+            self.indent.len()
+        }
+    }
+
     fn selection_line_span(&self) -> Option<(usize, usize)> {
         let (start, end) = self.selection_bounds()?;
         Some((start.0, end.0))
@@ -620,11 +601,12 @@ impl Editor {
             return;
         };
         self.begin_edit(EditGroup::Delete);
+        let width = self.dedent_width();
         let anchor_row = self.selection_anchor.map(|a| a.0);
         let mut cursor_removed = 0;
         let mut anchor_removed = 0;
         for row in start_row..=end_row {
-            let removed = Self::dedent_line_at(&mut self.lines[row]);
+            let removed = Self::dedent_line_at(&mut self.lines[row], width);
             if row == self.cursor_row {
                 cursor_removed = removed;
             }
@@ -642,25 +624,23 @@ impl Editor {
 
     fn dedent_line(&mut self) {
         self.begin_edit(EditGroup::Delete);
+        let width = self.dedent_width();
         let row = self.cursor_row;
-        let removed = Self::dedent_line_at(&mut self.lines[row]);
+        let removed = Self::dedent_line_at(&mut self.lines[row], width);
         self.cursor_col = self.cursor_col.saturating_sub(removed);
         self.desired_col = self.cursor_col;
         self.modified = true;
     }
 
     /// Removes one indent level from the start of `line` — a leading tab,
-    /// or up to four leading spaces, whichever the line actually uses, so
+    /// or up to `width` leading spaces, whichever the line actually uses, so
     /// Shift+Tab works on lines regardless of the file's dominant style.
     /// Returns how many characters were removed.
-    fn dedent_line_at(line: &mut String) -> usize {
+    fn dedent_line_at(line: &mut String, width: usize) -> usize {
         let remove = if line.starts_with('\t') {
             1
         } else {
-            line.chars()
-                .take(TAB_WIDTH)
-                .take_while(|c| *c == ' ')
-                .count()
+            line.chars().take(width).take_while(|c| *c == ' ').count()
         };
         if remove > 0 {
             let byte_idx = Self::byte_idx(line, remove);
@@ -693,8 +673,18 @@ impl Editor {
         let before = self.char_before_cursor();
         let after = self.char_at_cursor();
 
-        if self.language.allman_brace_split() && before == Some('{') && after == Some('}') {
-            let bi = Self::byte_idx(&line, self.cursor_col);
+        let bi = Self::byte_idx(&line, self.cursor_col);
+        let brace_split = self.language.brace_split();
+        let between_brackets = match (before, after) {
+            (Some('{'), Some('}')) => true,
+            // Arrays split too, but only where `[]` is data (JSON).
+            (Some('['), Some(']')) => brace_split == BraceSplit::KAndR,
+            _ => false,
+        };
+        let between_tags = self.language.auto_closes_tags()
+            && markup::between_tags(&line[..bi], &line[bi..], self.language.is_html());
+
+        if brace_split == BraceSplit::Allman && between_brackets {
             // `left` ends with the '{' itself since the cursor sits right
             // after it; strip that brace back off to get the code before it.
             let before_brace = line[..bi - 1].trim_end().to_string();
@@ -708,8 +698,20 @@ impl Editor {
 
             self.cursor_row = row + 2;
             self.cursor_col = inner_indent.chars().count();
+        } else if (brace_split == BraceSplit::KAndR && between_brackets) || between_tags {
+            // The opening bracket/tag stays where it is; an indented line
+            // for the cursor and the closing half on its own line follow.
+            let left = line[..bi].to_string();
+            let right = line[bi..].to_string();
+            let inner_indent = format!("{indent}{}", self.indent);
+
+            self.lines[row] = left;
+            self.lines.insert(row + 1, inner_indent.clone());
+            self.lines.insert(row + 2, format!("{indent}{right}"));
+
+            self.cursor_row = row + 1;
+            self.cursor_col = inner_indent.chars().count();
         } else {
-            let bi = Self::byte_idx(&line, self.cursor_col);
             let left = line[..bi].to_string();
             let right = line[bi..].to_string();
 
@@ -1853,5 +1855,208 @@ mod tests {
         ed.cursor_col = 10;
         ed.ensure_visible(20, 5);
         assert_eq!(ed.col_scroll, 40 + 1 - 20);
+    }
+
+    // ---- HTML / XML: smart tags ----
+
+    #[test]
+    fn html_typing_gt_autocloses_the_tag_and_enter_opens_it_up() {
+        let mut ed = new_editor_with_ext("html");
+        type_str(&mut ed, "<div>");
+        assert_eq!(ed.lines[0], "<div></div>");
+        assert_eq!(ed.cursor_col, 5, "cursor sits between the tags");
+
+        ed.newline();
+        assert_eq!(
+            ed.lines,
+            vec![
+                "<div>".to_string(),
+                "    ".to_string(),
+                "</div>".to_string()
+            ]
+        );
+        assert_eq!((ed.cursor_row, ed.cursor_col), (1, 4));
+    }
+
+    #[test]
+    fn html_nested_tags_each_autoclose() {
+        let mut ed = new_editor_with_ext("html");
+        type_str(&mut ed, "<ul>");
+        type_str(&mut ed, "<li class=\"a\">");
+        assert_eq!(ed.lines[0], "<ul><li class=\"a\"></li></ul>");
+        type_str(&mut ed, "x");
+        assert_eq!(ed.lines[0], "<ul><li class=\"a\">x</li></ul>");
+    }
+
+    #[test]
+    fn html_does_not_autoclose_void_closing_doctype_or_comments() {
+        for typed in [
+            "<br>",
+            "<img src=\"a.png\">",
+            "<br/>",
+            "</div>",
+            "<!DOCTYPE html>",
+            "<!-- note -->",
+            "1 < 2 > 0",
+        ] {
+            let mut ed = new_editor_with_ext("html");
+            type_str(&mut ed, typed);
+            assert_eq!(ed.lines[0], typed, "typing {typed:?}");
+        }
+    }
+
+    #[test]
+    fn xml_autocloses_every_opening_tag_even_html_void_names() {
+        let mut ed = new_editor_with_ext("xml");
+        type_str(&mut ed, "<br>");
+        assert_eq!(ed.lines[0], "<br></br>");
+
+        let mut proj = new_editor_with_ext("csproj");
+        type_str(&mut proj, "<ItemGroup>");
+        assert_eq!(proj.lines[0], "<ItemGroup></ItemGroup>");
+    }
+
+    #[test]
+    fn enter_in_html_without_a_tag_pair_is_plain_autoindent() {
+        let mut ed = new_editor_with_ext("html");
+        type_str(&mut ed, "<p>text");
+        assert_eq!(ed.lines[0], "<p>text</p>");
+
+        // Mid-line, Enter carries the rest of the line down...
+        ed.newline();
+        assert_eq!(ed.lines, vec!["<p>text".to_string(), "</p>".to_string()]);
+
+        // ...and at the end of a line with no tag pair around the cursor
+        // it's plain autoindent, not a tag split.
+        let mut ed = editor_with_lines("html", &["  <p>text</p>"]);
+        ed.cursor_col = 13;
+        ed.newline();
+        assert_eq!(ed.lines[1], "  ");
+    }
+
+    #[test]
+    fn tags_are_not_autoclosed_outside_html_and_xml() {
+        let mut ed = new_editor_with_ext("cs");
+        type_str(&mut ed, "List<int>");
+        assert_eq!(ed.lines[0], "List<int>");
+    }
+
+    // ---- JSON / CSS brace styles ----
+
+    #[test]
+    fn json_enter_between_braces_and_brackets_is_a_three_line_split() {
+        let mut obj = new_editor_with_ext("json");
+        type_str(&mut obj, "{");
+        obj.newline();
+        assert_eq!(
+            obj.lines,
+            vec!["{".to_string(), "    ".to_string(), "}".to_string()]
+        );
+        assert_eq!((obj.cursor_row, obj.cursor_col), (1, 4));
+
+        let mut arr = new_editor_with_ext("json");
+        type_str(&mut arr, "[");
+        arr.newline();
+        assert_eq!(
+            arr.lines,
+            vec!["[".to_string(), "    ".to_string(), "]".to_string()]
+        );
+    }
+
+    #[test]
+    fn brackets_only_split_for_json_not_for_allman_languages() {
+        let mut ed = new_editor_with_ext("cs");
+        type_str(&mut ed, "var a = [");
+        ed.newline();
+        // Generic deepen: `[` stays, the `]` lands on the new indented line.
+        assert_eq!(ed.lines[0], "var a = [");
+        assert_eq!(ed.lines[1], "    ]");
+    }
+
+    #[test]
+    fn css_enter_between_braces_is_allman_like_the_other_brace_languages() {
+        let mut ed = new_editor_with_ext("css");
+        type_str(&mut ed, ".box {");
+        ed.newline();
+        assert_eq!(
+            ed.lines,
+            vec![
+                ".box".to_string(),
+                "{".to_string(),
+                "    ".to_string(),
+                "}".to_string()
+            ]
+        );
+    }
+
+    // ---- YAML / Markdown ----
+
+    #[test]
+    fn yaml_indents_by_two_and_deepens_after_a_colon() {
+        let mut ed = new_editor_with_ext("yaml");
+        assert_eq!(ed.indent, "  ");
+        type_str(&mut ed, "services:");
+        ed.newline();
+        assert_eq!(ed.lines[1], "  ");
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn yaml_never_indents_with_tabs_even_if_the_file_does() {
+        let ed = editor_with_lines("yml", &["a:", "\tb: 1"]);
+        assert_eq!(ed.indent, "  ");
+    }
+
+    #[test]
+    fn markdown_apostrophes_are_not_autoclosed() {
+        let mut ed = new_editor_with_ext("md");
+        type_str(&mut ed, "don't stop");
+        assert_eq!(ed.lines[0], "don't stop");
+    }
+
+    // ---- indent width follows the file ----
+
+    #[test]
+    fn indent_width_is_the_narrowest_indentation_in_the_file() {
+        let two = editor_with_lines(
+            "html",
+            &["<div>", "  <p>", "    <b>x</b>", "  </p>", "</div>"],
+        );
+        assert_eq!(two.indent, "  ");
+        let four = editor_with_lines(
+            "cs",
+            &[
+                "class A",
+                "{",
+                "    void F()",
+                "    {",
+                "        x();",
+                "    }",
+                "}",
+            ],
+        );
+        assert_eq!(four.indent, "    ");
+        let eight = editor_with_lines("cs", &["a", "        b", "                c"]);
+        assert_eq!(eight.indent, "        ");
+        // An odd width (alignment, not indentation) falls back to the default.
+        let odd = editor_with_lines("cs", &["a", "     b"]);
+        assert_eq!(odd.indent, "    ");
+    }
+
+    #[test]
+    fn enter_and_dedent_use_the_files_two_space_width() {
+        // Enter after an open bracket deepens by the file's own width.
+        let mut json = editor_with_lines("json", &["{", "  \"k\": 1", "}"]);
+        json.cursor_row = 0;
+        json.cursor_col = 1; // right after the `{`
+        json.newline();
+        assert_eq!(json.lines[1], "  ", "two spaces, not four");
+
+        // Shift+Tab removes one two-space level.
+        let mut yaml = editor_with_lines("yaml", &["a:", "  b:", "    c: 1"]);
+        yaml.cursor_row = 2;
+        yaml.cursor_col = 0;
+        yaml.dedent();
+        assert_eq!(yaml.lines[2], "  c: 1", "removes 2 spaces, not 4");
     }
 }

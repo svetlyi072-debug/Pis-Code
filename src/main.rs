@@ -2,6 +2,8 @@ mod check;
 mod editor;
 mod file_io;
 mod input;
+mod language;
+mod markup;
 mod syntax;
 mod ui;
 

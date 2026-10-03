@@ -45,7 +45,7 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
                 && (m.contains(KeyModifiers::SHIFT) || c == 'S') =>
         {
             if editor.save() {
-                if editor.language == crate::editor::Language::Other {
+                if !editor.language.has_checker() {
                     editor.status_message = "Saved (no checker for this file type)".to_string();
                     editor.status_is_error = false;
                 } else {

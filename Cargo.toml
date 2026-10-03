@@ -15,6 +15,8 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 anyhow = "1"
 arboard = "3"
 regex = "1"
+serde_json = "1"
+yaml-rust = "0.4"
 
 [profile.release]
 opt-level = 3

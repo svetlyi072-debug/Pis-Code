@@ -599,7 +599,9 @@ dependencies = [
  "crossterm",
  "ratatui",
  "regex",
+ "serde_json",
  "syntect",
+ "yaml-rust",
 ]
 
 [[package]]

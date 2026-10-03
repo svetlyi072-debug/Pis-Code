@@ -7,7 +7,7 @@ use std::thread;
 
 use regex::Regex;
 
-use crate::editor::Language;
+use crate::language::Language;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -87,7 +87,11 @@ fn run_check(file_path: &Path, language: Language) -> CheckMessage {
         Language::JavaScript => run_check_javascript(file_path),
         Language::Python => run_check_python(file_path),
         Language::GdScript => run_check_gdscript(file_path),
-        Language::Other => {
+        Language::Html => run_check_markup(file_path, true),
+        Language::Xml => run_check_markup(file_path, false),
+        Language::Json => run_check_json(file_path),
+        Language::Yaml => run_check_yaml(file_path),
+        Language::Css | Language::Markdown | Language::Other => {
             CheckMessage::Failed("No checker available for this file type".to_string())
         }
     }
@@ -461,6 +465,75 @@ impl StripErrorMessage for str {
     }
 }
 
+// ==================== HTML / XML (built-in tag check) ====================
+
+fn run_check_markup(file_path: &Path, html: bool) -> CheckMessage {
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(e) => return CheckMessage::Failed(e.to_string()),
+    };
+    CheckMessage::Finished(
+        crate::markup::check(&source, html)
+            .into_iter()
+            .map(|e| Diagnostic {
+                line: e.line,
+                col: e.col,
+                severity: Severity::Error,
+                code: String::new(),
+                message: e.message,
+            })
+            .collect(),
+    )
+}
+
+// ==================== JSON / YAML (parsed in-process) ====================
+
+/// serde_json and yaml-rust both append ` at line N column M` to their
+/// messages; the location is shown through the diagnostic itself.
+fn strip_location(message: &str) -> String {
+    match message.rfind(" at line ") {
+        Some(i) => message[..i].to_string(),
+        None => message.to_string(),
+    }
+}
+
+fn run_check_json(file_path: &Path) -> CheckMessage {
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(e) => return CheckMessage::Failed(e.to_string()),
+    };
+    match serde_json::from_str::<serde_json::Value>(&source) {
+        Ok(_) => CheckMessage::Finished(Vec::new()),
+        Err(e) => CheckMessage::Finished(vec![Diagnostic {
+            line: e.line().saturating_sub(1),
+            col: e.column().saturating_sub(1),
+            severity: Severity::Error,
+            code: String::new(),
+            message: strip_location(&e.to_string()),
+        }]),
+    }
+}
+
+fn run_check_yaml(file_path: &Path) -> CheckMessage {
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(e) => return CheckMessage::Failed(e.to_string()),
+    };
+    match yaml_rust::YamlLoader::load_from_str(&source) {
+        Ok(_) => CheckMessage::Finished(Vec::new()),
+        Err(e) => {
+            let mark = e.marker();
+            CheckMessage::Finished(vec![Diagnostic {
+                line: mark.line().saturating_sub(1),
+                col: mark.col(),
+                severity: Severity::Error,
+                code: String::new(),
+                message: strip_location(&e.to_string()),
+            }])
+        }
+    }
+}
+
 // ==================== GDScript (Godot CLI) ====================
 //
 // Best-effort: Godot's `--check-only` output format is implemented from
@@ -694,5 +767,66 @@ mod tests {
             "Expected end of statement, found \":\" instead."
         );
         std::fs::remove_file(&file).ok();
+    }
+
+    fn temp_file_with(name_hint: &str, ext: &str, content: &str) -> PathBuf {
+        let path = temp_file(name_hint, ext);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn diagnostics_of(msg: CheckMessage) -> Vec<Diagnostic> {
+        match msg {
+            CheckMessage::Finished(d) => d,
+            CheckMessage::Failed(e) => panic!("check failed: {e}"),
+            CheckMessage::ToolMissing(t) => panic!("{t} missing"),
+        }
+    }
+
+    #[test]
+    fn json_syntax_errors_are_located() {
+        let file = temp_file_with("ok", "json", "{\"a\": [1, 2, {\"b\": null}]}");
+        assert!(diagnostics_of(run_check_json(&file)).is_empty());
+
+        let bad = temp_file_with("bad", "json", "{\n  \"a\": 1,\n  \"b\": ,\n}");
+        let diags = diagnostics_of(run_check_json(&bad));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].line, 2, "error is on the third line");
+        assert!(matches!(diags[0].severity, Severity::Error));
+        assert!(
+            !diags[0].message.contains(" at line "),
+            "location is shown by the diagnostic, not repeated in the text: {}",
+            diags[0].message
+        );
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_file(&bad).ok();
+    }
+
+    #[test]
+    fn yaml_syntax_errors_are_located() {
+        let file = temp_file_with("ok", "yaml", "a: 1\nb:\n  - x\n  - y\n");
+        assert!(diagnostics_of(run_check_yaml(&file)).is_empty());
+
+        let bad = temp_file_with("bad", "yaml", "a: 1\nb: [unclosed\nc: 2\n");
+        let diags = diagnostics_of(run_check_yaml(&bad));
+        assert_eq!(diags.len(), 1);
+        assert!(matches!(diags[0].severity, Severity::Error));
+        assert!(!diags[0].message.contains(" at line "));
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_file(&bad).ok();
+    }
+
+    #[test]
+    fn html_and_xml_tag_checks_report_diagnostics() {
+        let bad = temp_file_with("bad", "html", "<div>\n  <span>hi\n</div>\n");
+        let diags = diagnostics_of(run_check_markup(&bad, true));
+        assert_eq!(diags.len(), 1);
+        assert_eq!((diags[0].line, diags[0].col), (1, 2));
+        assert_eq!(diags[0].message, "unclosed <span>");
+
+        let ok = temp_file_with("ok", "xml", "<a><b/></a>");
+        assert!(diagnostics_of(run_check_markup(&ok, false)).is_empty());
+        std::fs::remove_file(&bad).ok();
+        std::fs::remove_file(&ok).ok();
     }
 }

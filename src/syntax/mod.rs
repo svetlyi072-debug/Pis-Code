@@ -1,4 +1,4 @@
-use crate::editor::Language;
+use crate::language::Language;
 use ratatui::style::{Color, Modifier, Style as RtStyle};
 use std::path::Path;
 use syntect::easy::HighlightLines;
@@ -22,15 +22,15 @@ struct SyntectBackend {
 
 impl Highlighter {
     pub fn new(path: &Path) -> Self {
-        let backend = match Language::from_path(path) {
-            Language::Other => None,
+        let language = Language::from_path(path);
+        let backend = match language {
             // syntect's bundled grammars have no GDScript, so it ships its
             // own (gdscript.sublime-syntax) in a set of its own.
             Language::GdScript => Some(SyntectBackend::gdscript()),
-            Language::CSharp => Some(SyntectBackend::bundled("cs")),
-            Language::JavaScript => Some(SyntectBackend::bundled("js")),
-            Language::Rust => Some(SyntectBackend::bundled("rs")),
-            Language::Python => Some(SyntectBackend::bundled("py")),
+            // `None` for the types left unstyled (see the struct docs).
+            other => other
+                .bundled_syntax_extension()
+                .map(SyntectBackend::bundled),
         };
         Self { backend }
     }
@@ -154,7 +154,13 @@ mod tests {
 
     #[test]
     fn unsupported_file_types_are_unstyled_so_terminal_colors_apply() {
-        for path in ["notes.txt", "data.json", "README.md", "Makefile"] {
+        for path in [
+            "notes.txt",
+            "data.csv",
+            "config.toml",
+            "main.go",
+            "Makefile",
+        ] {
             let rows = spans_for(path, "hello world 123 \"quoted\"");
             assert_eq!(rows.len(), 1, "{path}");
             for (style, _) in &rows[0] {
@@ -178,6 +184,37 @@ mod tests {
             assert!(
                 rows[0].iter().any(|(s, _)| s.fg.is_some()),
                 "{path} should have colored spans"
+            );
+        }
+    }
+
+    /// How many different colors a highlighted row uses. A grammar that
+    /// really loaded colors tokens differently; the plain-text fallback
+    /// paints everything one color.
+    fn distinct_colors(row: &[(RtStyle, String)]) -> usize {
+        let mut colors: Vec<_> = row.iter().filter_map(|(s, _)| s.fg).collect();
+        colors.dedup();
+        colors.sort_by_key(|c| format!("{c:?}"));
+        colors.dedup();
+        colors.len()
+    }
+
+    #[test]
+    fn web_and_markup_languages_have_real_grammars() {
+        for (path, source) in [
+            ("a.html", "<div class=\"a\">x</div>"),
+            ("a.css", "a { color: red; }"),
+            ("a.json", "{\"a\": 1, \"b\": \"x\"}"),
+            ("a.xml", "<a b=\"c\">d</a>"),
+            ("a.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>"),
+            ("a.yaml", "key: \"v\" # c"),
+            ("a.md", "# Title"),
+        ] {
+            let rows = spans_for(path, source);
+            assert!(
+                distinct_colors(&rows[0]) >= 2,
+                "{path} fell back to plain text: {:?}",
+                rows[0]
             );
         }
     }
