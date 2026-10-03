@@ -76,7 +76,18 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
         (KeyCode::Char('v'), m) if m.contains(KeyModifiers::CONTROL) => editor.paste(),
 
         (KeyCode::Enter, _) => editor.newline(),
-        (KeyCode::Backspace, m) if m.contains(KeyModifiers::CONTROL) => {
+        // "Delete word backward" arrives in different forms depending on
+        // the terminal: a real Ctrl+Backspace only where the Kitty keyboard
+        // protocol is active (Ghostty, Kitty, WezTerm); as Ctrl+H (byte
+        // 0x08) in terminals like xterm.js; as Alt+Backspace (ESC DEL)
+        // from readline-style setups; and as Ctrl+W, the classic shell
+        // binding. Accept all of them.
+        (KeyCode::Backspace, m)
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) =>
+        {
+            editor.delete_word_backward()
+        }
+        (KeyCode::Char('h' | 'w'), m) if m.contains(KeyModifiers::CONTROL) => {
             editor.delete_word_backward()
         }
         (KeyCode::Backspace, _) => editor.backspace(),
@@ -125,4 +136,55 @@ pub fn handle_key(editor: &mut Editor, key: KeyEvent) -> Action {
     }
 
     Action::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn editor_with(text: &str) -> Editor {
+        let mut ed = Editor::open(PathBuf::from("__input_test__.txt")).unwrap();
+        for c in text.chars() {
+            ed.insert_char(c);
+        }
+        ed
+    }
+
+    fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn every_encoding_of_delete_word_backward_works() {
+        for (name, key) in [
+            (
+                "Ctrl+Backspace (kitty protocol)",
+                press(KeyCode::Backspace, KeyModifiers::CONTROL),
+            ),
+            (
+                "Ctrl+H (byte 0x08, e.g. xterm.js)",
+                press(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            ),
+            (
+                "Ctrl+W (shell convention)",
+                press(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            ),
+            (
+                "Alt+Backspace (ESC DEL)",
+                press(KeyCode::Backspace, KeyModifiers::ALT),
+            ),
+        ] {
+            let mut ed = editor_with("foo bar");
+            handle_key(&mut ed, key);
+            assert_eq!(ed.lines[0], "foo ", "{name}");
+        }
+    }
+
+    #[test]
+    fn plain_backspace_still_deletes_one_character() {
+        let mut ed = editor_with("foo bar");
+        handle_key(&mut ed, press(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(ed.lines[0], "foo ba");
+    }
 }
