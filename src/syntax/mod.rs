@@ -5,10 +5,14 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SynStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder};
 
+/// The theme used when `syntax.theme` names none that exists.
+const DEFAULT_THEME: &str = "base16-ocean.dark";
+
 /// Syntax highlighting for the languages Pis Code knows (C#, JavaScript,
-/// Rust, Python, GDScript). Any other file type is deliberately left
-/// unstyled so its text renders in the terminal's own configured colors
-/// instead of a fixed theme foreground.
+/// Rust, Python, GDScript, HTML, ...). Any other file type — and every
+/// file when highlighting is switched off — is deliberately left unstyled
+/// so its text renders in the terminal's own configured colors instead of
+/// a fixed theme foreground.
 pub struct Highlighter {
     /// `None` means plain: no styling at all.
     backend: Option<SyntectBackend>,
@@ -20,19 +24,77 @@ struct SyntectBackend {
     syntax: SyntaxReference,
 }
 
+/// Names of the color themes that ship with the editor.
+pub fn theme_names() -> Vec<String> {
+    let mut names: Vec<String> = ThemeSet::load_defaults().themes.into_keys().collect();
+    names.sort();
+    names
+}
+
+/// Finds `name` among the built-in themes, or loads it as a `.tmTheme`
+/// file when it looks like a path. On failure returns a message and the
+/// default theme.
+fn load_theme(name: &str) -> (Theme, Option<String>) {
+    let mut themes = ThemeSet::load_defaults().themes;
+    let name = name.trim();
+    if let Some(theme) = themes.remove(name) {
+        return (theme, None);
+    }
+    // Built-in names are matched case-insensitively as a convenience.
+    if let Some(key) = themes
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(name))
+        .cloned()
+    {
+        return (themes.remove(&key).expect("key just found"), None);
+    }
+    let fallback = themes.remove(DEFAULT_THEME).unwrap_or_else(|| {
+        ThemeSet::load_defaults()
+            .themes
+            .into_values()
+            .next()
+            .unwrap()
+    });
+    let looks_like_file = name.ends_with(".tmTheme") || Path::new(name).is_file();
+    if looks_like_file {
+        return match ThemeSet::get_theme(name) {
+            Ok(theme) => (theme, None),
+            Err(e) => (
+                fallback,
+                Some(format!(
+                    "syntax.theme: can't load {name:?}: {e}; using {DEFAULT_THEME}"
+                )),
+            ),
+        };
+    }
+    (
+        fallback,
+        Some(format!(
+            "syntax.theme: unknown theme {name:?} (built in: {}; or a path to a .tmTheme file); using {DEFAULT_THEME}",
+            theme_names().join(", ")
+        )),
+    )
+}
+
 impl Highlighter {
-    pub fn new(path: &Path) -> Self {
-        let language = Language::from_path(path);
+    /// Highlighter for `language` in the named `theme`. With `enabled`
+    /// false the text is left unstyled. The second value is a warning when
+    /// the theme couldn't be found or loaded.
+    pub fn new(language: Language, enabled: bool, theme: &str) -> (Self, Option<String>) {
+        if !enabled {
+            return (Self { backend: None }, None);
+        }
+        let (theme, warning) = load_theme(theme);
         let backend = match language {
             // syntect's bundled grammars have no GDScript, so it ships its
             // own (gdscript.sublime-syntax) in a set of its own.
-            Language::GdScript => Some(SyntectBackend::gdscript()),
+            Language::GdScript => Some(SyntectBackend::gdscript(theme)),
             // `None` for the types left unstyled (see the struct docs).
             other => other
                 .bundled_syntax_extension()
-                .map(SyntectBackend::bundled),
+                .map(|ext| SyntectBackend::bundled(ext, theme)),
         };
-        Self { backend }
+        (Self { backend }, warning)
     }
 
     /// Highlight `lines[0..upto]` from the start of the buffer so
@@ -78,16 +140,7 @@ impl Highlighter {
 }
 
 impl SyntectBackend {
-    fn theme() -> Theme {
-        let theme_set = ThemeSet::load_defaults();
-        theme_set
-            .themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .unwrap_or_else(|| theme_set.themes.values().next().unwrap().clone())
-    }
-
-    fn bundled(extension: &str) -> Self {
+    fn bundled(extension: &str, theme: Theme) -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let syntax = syntax_set
             .find_syntax_by_extension(extension)
@@ -95,12 +148,12 @@ impl SyntectBackend {
             .unwrap_or_else(|| syntax_set.find_syntax_plain_text().clone());
         Self {
             syntax_set,
-            theme: Self::theme(),
+            theme,
             syntax,
         }
     }
 
-    fn gdscript() -> Self {
+    fn gdscript(theme: Theme) -> Self {
         let definition =
             SyntaxDefinition::load_from_str(include_str!("gdscript.sublime-syntax"), true, None)
                 .expect("bundled GDScript grammar is valid");
@@ -113,7 +166,7 @@ impl SyntectBackend {
             .expect("GDScript grammar registers the .gd extension");
         Self {
             syntax_set,
-            theme: Self::theme(),
+            theme,
             syntax,
         }
     }
@@ -140,7 +193,12 @@ mod tests {
 
     fn spans_for(path: &str, source: &str) -> Vec<Vec<(RtStyle, String)>> {
         let lines: Vec<String> = source.lines().map(String::from).collect();
-        Highlighter::new(Path::new(path)).highlight(&lines, lines.len())
+        highlighter_for(path).highlight(&lines, lines.len())
+    }
+
+    fn highlighter_for(path: &str) -> Highlighter {
+        let language = Language::from_path(Path::new(path));
+        Highlighter::new(language, true, DEFAULT_THEME).0
     }
 
     /// The foreground color of the first span whose text, ignoring the
@@ -312,11 +370,94 @@ func _ready() -> void:
     #[test]
     fn gdscript_unterminated_string_does_not_swallow_following_lines() {
         let rows = spans_for("a.gd", "var s = \"oops\nfunc f():\n\tpass");
-        let default = Highlighter::new(Path::new("a.gd")).highlight(&["x".to_string()], 1)[0][0]
+        let default = highlighter_for("a.gd").highlight(&["x".to_string()], 1)[0][0]
             .0
             .fg;
         // Line 2's `func` is still a keyword (colored, not default).
         let func = fg_of(&rows[1], "func").expect("func span");
         assert_ne!(Some(func), default);
+    }
+
+    fn colors_of(theme: &str, enabled: bool) -> (Vec<Option<Color>>, Option<String>) {
+        let (h, warning) = Highlighter::new(Language::Rust, enabled, theme);
+        let rows = h.highlight(&["fn main() { let x = 1; }".to_string()], 1);
+        (rows[0].iter().map(|(s, _)| s.fg).collect(), warning)
+    }
+
+    #[test]
+    fn highlighting_can_be_switched_off() {
+        let (off, warning) = colors_of(DEFAULT_THEME, false);
+        assert!(warning.is_none());
+        assert!(off.iter().all(|c| c.is_none()), "unstyled: {off:?}");
+        let (on, _) = colors_of(DEFAULT_THEME, true);
+        assert!(on.iter().any(|c| c.is_some()));
+    }
+
+    #[test]
+    fn the_theme_setting_changes_the_colors() {
+        let (dark, w1) = colors_of("base16-ocean.dark", true);
+        let (light, w2) = colors_of("InspiredGitHub", true);
+        assert!(w1.is_none() && w2.is_none());
+        assert_ne!(dark, light, "different themes, different colors");
+        let (case_insensitive, w3) = colors_of("inspiredgithub", true);
+        assert!(w3.is_none());
+        assert_eq!(light, case_insensitive);
+    }
+
+    #[test]
+    fn an_unknown_theme_warns_and_falls_back_to_the_default() {
+        let (colors, warning) = colors_of("no-such-theme", true);
+        let (default, _) = colors_of(DEFAULT_THEME, true);
+        assert_eq!(colors, default);
+        let warning = warning.expect("a warning");
+        assert!(
+            warning.contains("no-such-theme") && warning.contains("base16-ocean.dark"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn a_tmtheme_file_can_be_used_as_the_theme() {
+        let path = std::env::temp_dir().join(format!("pc_theme_{}.tmTheme", std::process::id()));
+        std::fs::write(
+            &path,
+            r##"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>name</key><string>Test</string>
+<key>settings</key><array>
+<dict><key>settings</key><dict>
+<key>foreground</key><string>#112233</string>
+<key>background</key><string>#000000</string>
+</dict></dict>
+<dict><key>scope</key><string>keyword</string><key>settings</key><dict>
+<key>foreground</key><string>#ff0000</string>
+</dict></dict>
+</array></dict></plist>"##,
+        )
+        .unwrap();
+        let (colors, warning) = colors_of(path.to_str().unwrap(), true);
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(
+            colors.contains(&Some(Color::Rgb(0xff, 0, 0))),
+            "keywords red: {colors:?}"
+        );
+        assert!(
+            colors.contains(&Some(Color::Rgb(0x11, 0x22, 0x33))),
+            "rest uses the theme foreground: {colors:?}"
+        );
+
+        std::fs::write(&path, "not a theme").unwrap();
+        let (_, warning) = colors_of(path.to_str().unwrap(), true);
+        assert!(warning.expect("warns").contains("can't load"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_language_decides_the_grammar_not_the_file_name() {
+        // `[associations]` maps odd extensions to a language; the
+        // highlighter follows the language it is given.
+        let (h, _) = Highlighter::new(Language::Rust, true, DEFAULT_THEME);
+        let rows = h.highlight(&["fn main() {}".to_string()], 1);
+        assert!(rows[0].iter().any(|(s, _)| s.fg.is_some()));
     }
 }

@@ -1,4 +1,5 @@
 use crate::check::Diagnostic;
+use crate::config::{IndentStyle, LineEnding, Settings};
 use crate::file_io;
 use crate::language::{BraceSplit, Language};
 use crate::markup;
@@ -6,49 +7,74 @@ use anyhow::Result;
 use std::ops::Range;
 use std::path::PathBuf;
 
-/// Width of a tab character on screen. Display only: the buffer keeps a
-/// real `\t`, the renderer shows it as spaces up to the next tab stop.
-pub const TAB_WIDTH: usize = 4;
-
-/// Picks the indent unit from the file's own content. The first indented
+/// What the file itself shows about its indentation: the first indented
 /// line decides tabs vs. spaces (a single leading space is ignored — that's
 /// usually the ` * ` of a block comment, not indentation); for spaces, the
-/// narrowest indentation seen is the unit, so a two-space file stays
-/// two-space. Falls back to the language's default for a file with no
-/// indentation yet.
-fn detect_indent(lines: &[String], language: Language) -> String {
+/// narrowest indentation seen is the unit (2, 3, 4 or 8), so a two-space
+/// file stays two-space. `None` for a file with no indentation yet.
+fn detect_indent(lines: &[String], language: Language) -> Option<String> {
     let leading_spaces = |l: &String| l.chars().take_while(|c| *c == ' ').count();
     let is_indented =
         |l: &String| l.starts_with('\t') || (leading_spaces(l) >= 2 && !l.trim().is_empty());
 
-    match lines.iter().find(|l| is_indented(l)) {
-        None => language.default_indent().to_string(),
-        Some(first) if first.starts_with('\t') && language.allows_tab_indent() => "\t".to_string(),
-        Some(_) => {
-            let narrowest = lines
-                .iter()
-                .filter(|l| !l.trim().is_empty())
-                .map(leading_spaces)
-                .filter(|&n| n >= 2)
-                .min();
-            match narrowest {
-                Some(n @ (2 | 3 | 4 | 8)) => " ".repeat(n),
-                _ => language.default_indent().to_string(),
-            }
+    let first = lines.iter().find(|l| is_indented(l))?;
+    if first.starts_with('\t') && language.allows_tab_indent() {
+        return Some("\t".to_string());
+    }
+    let narrowest = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(leading_spaces)
+        .filter(|&n| n >= 2)
+        .min();
+    match narrowest {
+        Some(n @ (2 | 3 | 4 | 8)) => Some(" ".repeat(n)),
+        _ => None, // odd widths are alignment, not an indent unit
+    }
+}
+
+/// One indent level for a file, from the `indent_style` / `indent_width` /
+/// `detect_indentation` settings, the file's own content, and the
+/// language's default (tabs for GDScript, two spaces for YAML, otherwise
+/// four spaces).
+fn choose_indent(lines: &[String], language: Language, s: &Settings) -> String {
+    let default = language.default_indent();
+    // Width in spaces when the default is spaces; GDScript's tab default
+    // has no width, so an explicit "spaces" there means four.
+    let default_width = if default == "\t" { 4 } else { default.len() };
+    let spaces = |width: Option<usize>| " ".repeat(width.unwrap_or(default_width));
+
+    match s.indent_style {
+        IndentStyle::Tabs => "\t".to_string(),
+        IndentStyle::Spaces => spaces(s.indent_width),
+        IndentStyle::Auto => {
+            let detected = if s.detect_indentation {
+                detect_indent(lines, language)
+            } else {
+                None
+            };
+            detected.unwrap_or_else(|| {
+                if default == "\t" {
+                    default.to_string()
+                } else {
+                    spaces(s.indent_width)
+                }
+            })
         }
     }
 }
 
 /// Screen column (in cells) at which each character of `line` starts, plus
 /// one final entry for the line's total width, expanding tabs to the next
-/// multiple of [`TAB_WIDTH`].
-pub fn display_columns(line: &str) -> Vec<usize> {
+/// multiple of `tab_width`.
+pub fn display_columns(line: &str, tab_width: usize) -> Vec<usize> {
+    let tab_width = tab_width.max(1);
     let mut cols = Vec::with_capacity(line.len() + 1);
     let mut col = 0;
     for ch in line.chars() {
         cols.push(col);
         col += if ch == '\t' {
-            TAB_WIDTH - col % TAB_WIDTH
+            tab_width - col % tab_width
         } else {
             1
         };
@@ -118,8 +144,14 @@ pub struct Editor {
     pub cursor_col: usize,
     pub file_path: PathBuf,
     pub language: Language,
-    /// One level of indentation: a tab or four spaces, see [`detect_indent`].
+    pub settings: Settings,
+    /// One level of indentation, see [`choose_indent`].
     indent: String,
+    /// Whether the file used CRLF line endings when it was loaded.
+    file_crlf: bool,
+    /// Height of the text area as of the last draw; PageUp/PageDown and
+    /// `scroll_off` need it.
+    viewport_height: usize,
     pub modified: bool,
 
     /// Top-left visible cell, in (line, char) space.
@@ -146,17 +178,27 @@ pub struct Editor {
 }
 
 impl Editor {
+    /// Opens `path` with the built-in behavior for its language.
+    #[cfg(test)]
     pub fn open(path: PathBuf) -> Result<Self> {
-        let lines = file_io::load_or_create(&path)?;
         let language = Language::from_path(&path);
-        let indent = detect_indent(&lines, language);
+        Self::open_with(path, language, Settings::for_language(language))
+    }
+
+    /// Opens `path` as `language` with already-resolved `settings`.
+    pub fn open_with(path: PathBuf, language: Language, settings: Settings) -> Result<Self> {
+        let loaded = file_io::load_or_create(&path)?;
+        let indent = choose_indent(&loaded.lines, language, &settings);
         Ok(Self {
-            lines,
+            lines: loaded.lines,
             cursor_row: 0,
             cursor_col: 0,
             file_path: path,
             language,
+            settings,
             indent,
+            file_crlf: loaded.crlf,
+            viewport_height: 0,
             modified: false,
             scroll: 0,
             col_scroll: 0,
@@ -173,6 +215,11 @@ impl Editor {
             redo_stack: Vec::new(),
             last_edit_group: EditGroup::None,
         })
+    }
+
+    /// How wide a tab is drawn, in columns.
+    pub fn tab_width(&self) -> usize {
+        self.settings.tab_width
     }
 
     pub fn line_count(&self) -> usize {
@@ -218,10 +265,12 @@ impl Editor {
             .collect()
     }
 
-    fn char_class(c: char) -> CharClass {
+    /// `extra` lists the non-alphanumeric characters that count as part of
+    /// a word (the `word_chars` setting).
+    fn char_class(c: char, extra: &str) -> CharClass {
         if c.is_whitespace() {
             CharClass::Whitespace
-        } else if c.is_alphanumeric() || c == '_' {
+        } else if c.is_alphanumeric() || extra.contains(c) {
             CharClass::Word
         } else {
             CharClass::Other
@@ -232,17 +281,17 @@ impl Editor {
     /// whitespace immediately before the cursor, then skip the run of
     /// same-class characters before that (identifiers and runs of
     /// punctuation are treated as separate word stops).
-    fn prev_word_boundary(line: &str, col: usize) -> usize {
+    fn prev_word_boundary(line: &str, col: usize, extra: &str) -> usize {
         let chars: Vec<char> = line.chars().collect();
         let mut i = col.min(chars.len());
-        while i > 0 && Self::char_class(chars[i - 1]) == CharClass::Whitespace {
+        while i > 0 && Self::char_class(chars[i - 1], extra) == CharClass::Whitespace {
             i -= 1;
         }
         if i == 0 {
             return 0;
         }
-        let class = Self::char_class(chars[i - 1]);
-        while i > 0 && Self::char_class(chars[i - 1]) == class {
+        let class = Self::char_class(chars[i - 1], extra);
+        while i > 0 && Self::char_class(chars[i - 1], extra) == class {
             i -= 1;
         }
         i
@@ -250,18 +299,18 @@ impl Editor {
 
     /// The column one word to the right of `col` on `line`; mirrors
     /// `prev_word_boundary`.
-    fn next_word_boundary(line: &str, col: usize) -> usize {
+    fn next_word_boundary(line: &str, col: usize, extra: &str) -> usize {
         let chars: Vec<char> = line.chars().collect();
         let len = chars.len();
         let mut i = col.min(len);
-        while i < len && Self::char_class(chars[i]) == CharClass::Whitespace {
+        while i < len && Self::char_class(chars[i], extra) == CharClass::Whitespace {
             i += 1;
         }
         if i == len {
             return len;
         }
-        let class = Self::char_class(chars[i]);
-        while i < len && Self::char_class(chars[i]) == class {
+        let class = Self::char_class(chars[i], extra);
+        while i < len && Self::char_class(chars[i], extra) == class {
             i += 1;
         }
         i
@@ -377,6 +426,10 @@ impl Editor {
     fn begin_edit(&mut self, group: EditGroup) {
         if self.last_edit_group != group {
             self.undo_stack.push(self.snapshot());
+            if self.undo_stack.len() > self.settings.undo_limit {
+                let excess = self.undo_stack.len() - self.settings.undo_limit;
+                self.undo_stack.drain(..excess);
+            }
             self.redo_stack.clear();
             self.last_edit_group = group;
         }
@@ -466,7 +519,7 @@ impl Editor {
             self.delete_selection_as(EditGroup::Insert);
         }
         match c {
-            '{' | '(' | '[' => {
+            '{' | '(' | '[' if self.settings.auto_close_brackets => {
                 self.begin_edit(EditGroup::Insert);
                 let close = match c {
                     '{' => '}',
@@ -478,13 +531,15 @@ impl Editor {
                 self.insert_raw(close);
                 self.cursor_col -= 1;
             }
-            '}' | ')' | ']' if self.char_at_cursor() == Some(c) => {
+            '}' | ')' | ']'
+                if self.settings.auto_close_brackets && self.char_at_cursor() == Some(c) =>
+            {
                 // Type over an already-present closing bracket instead of
                 // inserting a duplicate.
                 self.begin_edit(EditGroup::Insert);
                 self.cursor_col += 1;
             }
-            '>' if self.language.auto_closes_tags() => {
+            '>' if self.settings.auto_close_tags => {
                 // HTML/XML: finishing an opening tag inserts its closing
                 // tag after the cursor, leaving the cursor between them.
                 self.begin_edit(EditGroup::Insert);
@@ -499,15 +554,10 @@ impl Editor {
                     self.cursor_col = between;
                 }
             }
-            '\'' if !self.language.autocloses_single_quote() => {
-                // Rust: `'` is used constantly for lifetimes (`&'a str`),
-                // and in Markdown it's an apostrophe — autoclosing it into
-                // `''` there is more nuisance than help, so insert it
-                // plainly.
-                self.begin_edit(EditGroup::Insert);
-                self.insert_raw(c);
-            }
-            '"' | '\'' | '`' => {
+            '"' | '\'' | '`'
+                if self.settings.auto_close_quotes
+                    && (c != '\'' || self.settings.auto_close_single_quote) =>
+            {
                 self.begin_edit(EditGroup::Insert);
                 if self.char_at_cursor() == Some(c) {
                     // Type over an already-present closing quote.
@@ -565,7 +615,7 @@ impl Editor {
     /// width, or a tab-width's worth when the file is tab-indented.
     fn dedent_width(&self) -> usize {
         if self.indent == "\t" {
-            TAB_WIDTH
+            self.settings.tab_width
         } else {
             self.indent.len()
         }
@@ -668,20 +718,38 @@ impl Editor {
 
         let row = self.cursor_row;
         let line = self.lines[row].clone();
-        let indent = Self::leading_whitespace(&line);
+        // With auto_indent off, new lines start at column 0: nothing is
+        // copied from this line and nothing is added for a deeper level.
+        let auto_indent = self.settings.auto_indent;
+        let indent = if auto_indent {
+            Self::leading_whitespace(&line)
+        } else {
+            String::new()
+        };
+        let unit = if auto_indent {
+            self.indent.clone()
+        } else {
+            String::new()
+        };
 
         let before = self.char_before_cursor();
         let after = self.char_at_cursor();
 
         let bi = Self::byte_idx(&line, self.cursor_col);
-        let brace_split = self.language.brace_split();
+        let smart = self.settings.smart_enter;
+        let brace_split = if smart {
+            self.settings.brace_split
+        } else {
+            BraceSplit::None
+        };
         let between_brackets = match (before, after) {
             (Some('{'), Some('}')) => true,
             // Arrays split too, but only where `[]` is data (JSON).
             (Some('['), Some(']')) => brace_split == BraceSplit::KAndR,
             _ => false,
         };
-        let between_tags = self.language.auto_closes_tags()
+        let between_tags = smart
+            && self.language.has_tags()
             && markup::between_tags(&line[..bi], &line[bi..], self.language.is_html());
 
         if brace_split == BraceSplit::Allman && between_brackets {
@@ -689,21 +757,29 @@ impl Editor {
             // after it; strip that brace back off to get the code before it.
             let before_brace = line[..bi - 1].trim_end().to_string();
             let right = line[bi..].to_string();
-            let inner_indent = format!("{indent}{}", self.indent);
+            let inner_indent = format!("{indent}{unit}");
 
-            self.lines[row] = before_brace;
-            self.lines.insert(row + 1, format!("{indent}{{"));
-            self.lines.insert(row + 2, inner_indent.clone());
-            self.lines.insert(row + 3, format!("{indent}{right}"));
+            // A brace that already starts its line stays where it is,
+            // instead of leaving a blank line above it.
+            let brace_on_own_line = before_brace.trim().is_empty();
+            let first = if brace_on_own_line { row } else { row + 1 };
+            if brace_on_own_line {
+                self.lines[row] = format!("{indent}{{");
+            } else {
+                self.lines[row] = before_brace;
+                self.lines.insert(first, format!("{indent}{{"));
+            }
+            self.lines.insert(first + 1, inner_indent.clone());
+            self.lines.insert(first + 2, format!("{indent}{right}"));
 
-            self.cursor_row = row + 2;
+            self.cursor_row = first + 1;
             self.cursor_col = inner_indent.chars().count();
         } else if (brace_split == BraceSplit::KAndR && between_brackets) || between_tags {
             // The opening bracket/tag stays where it is; an indented line
             // for the cursor and the closing half on its own line follow.
             let left = line[..bi].to_string();
             let right = line[bi..].to_string();
-            let inner_indent = format!("{indent}{}", self.indent);
+            let inner_indent = format!("{indent}{unit}");
 
             self.lines[row] = left;
             self.lines.insert(row + 1, inner_indent.clone());
@@ -721,8 +797,8 @@ impl Editor {
                 || trimmed_left.ends_with('[')
                 || (self.language.colon_deepens_indent() && trimmed_left.ends_with(':'));
 
-            let new_indent = if deepen {
-                format!("{indent}{}", self.indent)
+            let new_indent = if deepen && auto_indent {
+                format!("{indent}{unit}")
             } else {
                 indent
             };
@@ -762,15 +838,18 @@ impl Editor {
             self.begin_edit(EditGroup::Delete);
             let before = self.char_before_cursor();
             let after = self.char_at_cursor();
-            let is_pair = matches!(
-                (before, after),
-                (Some('{'), Some('}'))
-                    | (Some('('), Some(')'))
-                    | (Some('['), Some(']'))
-                    | (Some('"'), Some('"'))
-                    | (Some('\''), Some('\''))
-                    | (Some('`'), Some('`'))
-            );
+            // Only pairs the editor would itself have auto-closed.
+            let brackets = self.settings.auto_close_brackets;
+            let quotes = self.settings.auto_close_quotes;
+            let single = quotes && self.settings.auto_close_single_quote;
+            let is_pair = match (before, after) {
+                (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']')) => {
+                    brackets
+                }
+                (Some('"'), Some('"')) | (Some('`'), Some('`')) => quotes,
+                (Some('\''), Some('\'')) => single,
+                _ => false,
+            };
             if is_pair {
                 let row = self.cursor_row;
                 self.remove_chars(row, self.cursor_col - 1, self.cursor_col + 1);
@@ -926,17 +1005,25 @@ impl Editor {
     pub fn move_end_select(&mut self) {
         self.move_end_impl(true);
     }
-    pub fn page_up(&mut self, page: usize) {
-        self.page_up_impl(page, false);
+    /// Lines a PageUp/PageDown moves: the `page_size` setting, or one line
+    /// short of a screenful when that is 0.
+    fn page_lines(&self) -> usize {
+        match self.settings.page_size {
+            0 => self.viewport_height.saturating_sub(1).max(1),
+            n => n,
+        }
     }
-    pub fn page_up_select(&mut self, page: usize) {
-        self.page_up_impl(page, true);
+    pub fn page_up(&mut self) {
+        self.page_up_impl(self.page_lines(), false);
     }
-    pub fn page_down(&mut self, page: usize) {
-        self.page_down_impl(page, false);
+    pub fn page_up_select(&mut self) {
+        self.page_up_impl(self.page_lines(), true);
     }
-    pub fn page_down_select(&mut self, page: usize) {
-        self.page_down_impl(page, true);
+    pub fn page_down(&mut self) {
+        self.page_down_impl(self.page_lines(), false);
+    }
+    pub fn page_down_select(&mut self) {
+        self.page_down_impl(self.page_lines(), true);
     }
 
     fn move_word_left_impl(&mut self, select: bool) {
@@ -948,7 +1035,8 @@ impl Editor {
             }
         } else {
             let line = self.current_line().to_string();
-            self.cursor_col = Self::prev_word_boundary(&line, self.cursor_col);
+            self.cursor_col =
+                Self::prev_word_boundary(&line, self.cursor_col, &self.settings.word_chars);
         }
         self.desired_col = self.cursor_col;
     }
@@ -963,7 +1051,8 @@ impl Editor {
             }
         } else {
             let line = self.current_line().to_string();
-            self.cursor_col = Self::next_word_boundary(&line, self.cursor_col);
+            self.cursor_col =
+                Self::next_word_boundary(&line, self.cursor_col, &self.settings.word_chars);
         }
         self.desired_col = self.cursor_col;
     }
@@ -996,7 +1085,7 @@ impl Editor {
         }
         self.begin_edit(EditGroup::Delete);
         let line = self.current_line().to_string();
-        let new_col = Self::prev_word_boundary(&line, self.cursor_col);
+        let new_col = Self::prev_word_boundary(&line, self.cursor_col, &self.settings.word_chars);
         let row = self.cursor_row;
         self.remove_chars(row, new_col, self.cursor_col);
         self.cursor_col = new_col;
@@ -1019,7 +1108,7 @@ impl Editor {
         }
         self.begin_edit(EditGroup::Delete);
         let line = self.current_line().to_string();
-        let new_col = Self::next_word_boundary(&line, self.cursor_col);
+        let new_col = Self::next_word_boundary(&line, self.cursor_col, &self.settings.word_chars);
         let row = self.cursor_row;
         self.remove_chars(row, self.cursor_col, new_col);
         self.desired_col = self.cursor_col;
@@ -1131,18 +1220,22 @@ impl Editor {
     /// The cursor's horizontal position in screen cells, i.e. with tabs
     /// before it expanded (`cursor_col` itself counts characters).
     pub fn cursor_display_col(&self) -> usize {
-        let cols = display_columns(self.current_line());
+        let cols = display_columns(self.current_line(), self.settings.tab_width);
         cols[self.cursor_col.min(cols.len() - 1)]
     }
 
     /// Scrolls so the cursor is on screen. `col_scroll` is in screen
     /// cells (not characters), so tab-indented lines scroll correctly.
     pub fn ensure_visible(&mut self, width: usize, height: usize) {
+        self.viewport_height = height;
         if height > 0 {
-            if self.cursor_row < self.scroll {
-                self.scroll = self.cursor_row;
-            } else if self.cursor_row >= self.scroll + height {
-                self.scroll = self.cursor_row + 1 - height;
+            // `scroll_off` lines of context above and below the cursor,
+            // but never more than fits (so it can't make the view jump).
+            let margin = self.settings.scroll_off.min(height.saturating_sub(1) / 2);
+            if self.cursor_row < self.scroll + margin {
+                self.scroll = self.cursor_row.saturating_sub(margin);
+            } else if self.cursor_row + margin >= self.scroll + height {
+                self.scroll = self.cursor_row + margin + 1 - height;
             }
         }
         if width > 0 {
@@ -1159,7 +1252,20 @@ impl Editor {
 
     /// Returns `true` if the save succeeded.
     pub fn save(&mut self) -> bool {
-        match file_io::save(&self.file_path, &self.lines) {
+        if self.settings.trim_trailing_whitespace {
+            self.trim_trailing_whitespace();
+        }
+        let crlf = match self.settings.line_ending {
+            LineEnding::Lf => false,
+            LineEnding::Crlf => true,
+            LineEnding::Auto => self.file_crlf,
+        };
+        match file_io::save(
+            &self.file_path,
+            &self.lines,
+            crlf,
+            self.settings.insert_final_newline,
+        ) {
             Ok(()) => {
                 self.modified = false;
                 self.confirm_quit = false;
@@ -1172,6 +1278,21 @@ impl Editor {
                 self.status_is_error = true;
                 false
             }
+        }
+    }
+
+    /// Strips trailing spaces and tabs from every line, keeping the cursor
+    /// and selection on valid columns.
+    fn trim_trailing_whitespace(&mut self) {
+        for line in &mut self.lines {
+            let kept = line.trim_end_matches([' ', '\t']).len();
+            line.truncate(kept);
+        }
+        self.clamp_cursor();
+        let lines = &self.lines;
+        if let Some((row, col)) = self.selection_anchor.as_mut() {
+            *row = (*row).min(lines.len() - 1);
+            *col = (*col).min(lines[*row].chars().count());
         }
     }
 
@@ -1762,7 +1883,7 @@ mod tests {
     fn editor_with_lines(ext: &str, lines: &[&str]) -> Editor {
         let mut ed = new_editor_with_ext(ext);
         ed.lines = lines.iter().map(|l| l.to_string()).collect();
-        ed.indent = detect_indent(&ed.lines, ed.language);
+        ed.indent = choose_indent(&ed.lines, ed.language, &ed.settings);
         ed
     }
 
@@ -1833,9 +1954,9 @@ mod tests {
     fn display_columns_expand_tabs_to_the_next_tab_stop() {
         // '\t' at col 0 -> 4 wide, 'a','b' at 4,5, '\t' at 6 -> 2 wide,
         // 'c' at 8, end at 9.
-        assert_eq!(display_columns("\tab\tc"), vec![0, 4, 5, 6, 8, 9]);
-        assert_eq!(display_columns(""), vec![0]);
-        assert_eq!(display_columns("abc"), vec![0, 1, 2, 3]);
+        assert_eq!(display_columns("\tab\tc", 4), vec![0, 4, 5, 6, 8, 9]);
+        assert_eq!(display_columns("", 4), vec![0]);
+        assert_eq!(display_columns("abc", 4), vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -2058,5 +2179,572 @@ mod tests {
         yaml.cursor_col = 0;
         yaml.dedent();
         assert_eq!(yaml.lines[2], "  c: 1", "removes 2 spaces, not 4");
+    }
+}
+
+/// Every editing setting, checked against the behavior it controls.
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use crate::config::{BraceStyle, Config, LanguageOverride};
+
+    fn temp(name: &str) -> PathBuf {
+        // The extension must stay last: it decides the language.
+        std::env::temp_dir().join(format!("pc_settings_{}_{name}", std::process::id()))
+    }
+
+    /// An empty buffer for `file_name` with `tweak` applied to the config.
+    fn editor(file_name: &str, tweak: impl FnOnce(&mut Config)) -> Editor {
+        let mut config = Config::default();
+        tweak(&mut config);
+        let path = PathBuf::from(format!("__nonexistent__/{file_name}"));
+        let language = config.language_of(&path);
+        let settings = Settings::resolve(&config, language);
+        Editor::open_with(path, language, settings).unwrap()
+    }
+
+    /// A buffer loaded from real content.
+    fn editor_with_content(
+        file_name: &str,
+        content: &str,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Editor {
+        let path = temp(file_name);
+        std::fs::write(&path, content).unwrap();
+        let mut config = Config::default();
+        tweak(&mut config);
+        let language = config.language_of(&path);
+        let settings = Settings::resolve(&config, language);
+        let ed = Editor::open_with(path.clone(), language, settings).unwrap();
+        let _ = std::fs::remove_file(path);
+        ed
+    }
+
+    fn type_str(ed: &mut Editor, s: &str) {
+        for c in s.chars() {
+            ed.insert_char(c);
+        }
+    }
+
+    // ---- display ----
+
+    #[test]
+    fn tab_width_sets_how_far_a_tab_reaches() {
+        assert_eq!(display_columns("\tx", 2), vec![0, 2, 3]);
+        assert_eq!(display_columns("\tx", 8), vec![0, 8, 9]);
+        assert_eq!(
+            display_columns("ab\tx", 4),
+            vec![0, 1, 2, 4, 5],
+            "next stop, not a fixed width"
+        );
+
+        let mut ed = editor("a.rs", |c| c.editor.tab_width = 8);
+        ed.lines[0] = "\tab".to_string();
+        ed.cursor_col = 1;
+        assert_eq!(ed.cursor_display_col(), 8);
+        let mut ed = editor("a.rs", |c| c.editor.tab_width = 2);
+        ed.lines[0] = "\tab".to_string();
+        ed.cursor_col = 1;
+        assert_eq!(ed.cursor_display_col(), 2);
+    }
+
+    #[test]
+    fn a_language_can_have_its_own_tab_width() {
+        let ed = editor("a.py", |c| {
+            c.languages.insert(
+                "python".into(),
+                LanguageOverride {
+                    tab_width: Some(2),
+                    ..Default::default()
+                },
+            );
+        });
+        assert_eq!(ed.tab_width(), 2);
+        assert_eq!(editor("a.rs", |_| {}).tab_width(), 4);
+    }
+
+    // ---- indentation ----
+
+    #[test]
+    fn indent_style_and_width_decide_what_tab_inserts() {
+        let mut ed = editor("a.rs", |c| c.editor.indent_style = IndentStyle::Tabs);
+        ed.insert_tab();
+        assert_eq!(ed.lines[0], "\t");
+
+        let mut ed = editor("a.rs", |c| {
+            c.editor.indent_style = IndentStyle::Spaces;
+            c.editor.indent_width = Some(2);
+        });
+        ed.insert_tab();
+        assert_eq!(ed.lines[0], "  ");
+
+        // Auto with nothing in the file to learn from: indent_width alone.
+        let mut ed = editor("a.rs", |c| c.editor.indent_width = Some(3));
+        ed.insert_tab();
+        assert_eq!(ed.lines[0], "   ");
+
+        // Spaces is spaces even for GDScript, whose own default is a tab.
+        let mut ed = editor("a.gd", |c| c.editor.indent_style = IndentStyle::Spaces);
+        ed.insert_tab();
+        assert_eq!(ed.lines[0], "    ");
+    }
+
+    #[test]
+    fn detect_indentation_lets_the_file_win_unless_switched_off() {
+        let content = "fn a() {\n\tx;\n}\n";
+        let mut learned = editor_with_content("detect_on.rs", content, |_| {});
+        learned.insert_tab();
+        assert_eq!(learned.lines[0], "\tfn a() {", "followed the file's tab");
+
+        let mut ignored = editor_with_content("detect_off.rs", content, |c| {
+            c.editor.detect_indentation = false
+        });
+        ignored.insert_tab();
+        assert_eq!(
+            ignored.lines[0], "    fn a() {",
+            "used the language default"
+        );
+
+        // Forcing the style beats detection too.
+        let mut forced = editor_with_content("detect_forced.rs", content, |c| {
+            c.editor.indent_style = IndentStyle::Spaces;
+        });
+        forced.insert_tab();
+        assert_eq!(forced.lines[0], "    fn a() {");
+    }
+
+    #[test]
+    fn auto_indent_off_starts_every_line_at_column_zero() {
+        let mut on = editor("a.rs", |_| {});
+        type_str(&mut on, "    foo");
+        on.newline();
+        assert_eq!(on.lines[1], "    ");
+
+        let mut off = editor("a.rs", |c| c.editor.auto_indent = false);
+        type_str(&mut off, "    foo");
+        off.newline();
+        assert_eq!(off.lines[1], "");
+        assert_eq!(off.cursor_col, 0);
+
+        // ...including after an opening bracket.
+        let mut off = editor("a.py", |c| c.editor.auto_indent = false);
+        type_str(&mut off, "if x:");
+        off.newline();
+        assert_eq!(off.lines[1], "");
+    }
+
+    #[test]
+    fn auto_indent_off_also_drops_the_indent_of_the_smart_brace_split() {
+        let mut ed = editor("a.cs", |c| c.editor.auto_indent = false);
+        type_str(&mut ed, "void F() {");
+        ed.newline();
+        assert_eq!(ed.lines, vec!["void F()", "{", "", "}"]);
+    }
+
+    #[test]
+    fn smart_enter_off_gives_a_plain_newline_between_braces() {
+        let mut ed = editor("a.cs", |c| c.editor.smart_enter = false);
+        type_str(&mut ed, "void F() {");
+        ed.newline();
+        // No Allman split: the line is just broken in two.
+        assert_eq!(ed.lines, vec!["void F() {", "    }"]);
+
+        let mut html = editor("a.html", |c| c.editor.smart_enter = false);
+        type_str(&mut html, "<div>");
+        html.cursor_col = 5;
+        html.newline();
+        assert_eq!(html.lines.len(), 2, "no tag split either: {:?}", html.lines);
+    }
+
+    #[test]
+    fn brace_style_changes_how_enter_splits_braces() {
+        let mut allman = editor("a.cs", |_| {});
+        type_str(&mut allman, "void F() {");
+        allman.newline();
+        assert_eq!(allman.lines, vec!["void F()", "{", "    ", "}"]);
+
+        let mut kr = editor("a.cs", |c| c.editor.brace_style = BraceStyle::KAndR);
+        type_str(&mut kr, "void F() {");
+        kr.newline();
+        assert_eq!(kr.lines, vec!["void F() {", "    ", "}"]);
+
+        let mut off = editor("a.cs", |c| c.editor.brace_style = BraceStyle::Off);
+        type_str(&mut off, "void F() {");
+        off.newline();
+        assert_eq!(off.lines, vec!["void F() {", "    }"]);
+
+        let mut forced = editor("a.py", |c| c.editor.brace_style = BraceStyle::Allman);
+        type_str(&mut forced, "d = {");
+        forced.newline();
+        assert_eq!(
+            forced.lines,
+            vec!["d =", "{", "    ", "}"],
+            "Python normally never splits"
+        );
+    }
+
+    #[test]
+    fn a_lone_brace_pair_does_not_leave_a_blank_line_above_it() {
+        let mut ed = editor("a.cs", |_| {});
+        type_str(&mut ed, "{");
+        ed.newline();
+        assert_eq!(ed.lines, vec!["{", "    ", "}"], "{:?}", ed.lines);
+    }
+
+    // ---- auto-closing ----
+
+    #[test]
+    fn auto_close_brackets_off_types_only_what_you_type() {
+        let mut ed = editor("a.rs", |c| c.editor.auto_close_brackets = false);
+        type_str(&mut ed, "f(");
+        assert_eq!(ed.lines[0], "f(");
+        type_str(&mut ed, ")");
+        assert_eq!(ed.lines[0], "f()", "no type-over either");
+        let mut ed = editor("a.rs", |c| c.editor.auto_close_brackets = false);
+        type_str(&mut ed, "{[");
+        assert_eq!(ed.lines[0], "{[");
+        // Quotes are a separate switch.
+        let mut ed = editor("a.rs", |c| c.editor.auto_close_brackets = false);
+        type_str(&mut ed, "\"");
+        assert_eq!(ed.lines[0], "\"\"");
+    }
+
+    #[test]
+    fn auto_close_quotes_off_disables_every_kind_of_quote() {
+        let mut ed = editor("a.cs", |c| c.editor.auto_close_quotes = false);
+        type_str(&mut ed, "\"'`");
+        assert_eq!(ed.lines[0], "\"'`");
+        let mut ed = editor("a.cs", |c| c.editor.auto_close_quotes = false);
+        type_str(&mut ed, "(");
+        assert_eq!(ed.lines[0], "()", "brackets are a separate switch");
+    }
+
+    #[test]
+    fn single_quote_autoclose_follows_the_language_unless_set() {
+        // Rust: `'a` is a lifetime, so off by default...
+        let mut rust = editor("a.rs", |_| {});
+        type_str(&mut rust, "'");
+        assert_eq!(rust.lines[0], "'");
+        // ...C# is the other way round...
+        let mut cs = editor("a.cs", |_| {});
+        type_str(&mut cs, "'");
+        assert_eq!(cs.lines[0], "''");
+        // ...and the setting overrides either default, globally or per language.
+        let mut rust = editor("a.rs", |c| c.editor.auto_close_single_quote = Some(true));
+        type_str(&mut rust, "'");
+        assert_eq!(rust.lines[0], "''");
+        let mut cs = editor("a.cs", |c| {
+            c.languages.insert(
+                "csharp".into(),
+                LanguageOverride {
+                    auto_close_single_quote: Some(false),
+                    ..Default::default()
+                },
+            );
+        });
+        type_str(&mut cs, "'");
+        assert_eq!(cs.lines[0], "'");
+    }
+
+    #[test]
+    fn auto_close_tags_can_be_switched_off() {
+        let mut on = editor("a.html", |_| {});
+        type_str(&mut on, "<div>");
+        assert_eq!(on.lines[0], "<div></div>");
+        let mut off = editor("a.html", |c| c.editor.auto_close_tags = false);
+        type_str(&mut off, "<div>");
+        assert_eq!(off.lines[0], "<div>");
+    }
+
+    #[test]
+    fn backspace_only_removes_pairs_that_would_have_been_auto_inserted() {
+        // With auto-closing on, backspace deletes the empty pair as a unit.
+        let mut on = editor("a.rs", |_| {});
+        type_str(&mut on, "(");
+        on.backspace();
+        assert_eq!(on.lines[0], "");
+        // With it off, the user typed `()` by hand: one backspace, one char.
+        let mut off = editor("a.rs", |c| c.editor.auto_close_brackets = false);
+        type_str(&mut off, "()");
+        off.cursor_col = 1;
+        off.backspace();
+        assert_eq!(off.lines[0], ")");
+    }
+
+    // ---- movement ----
+
+    fn tall(n: usize, tweak: impl FnOnce(&mut Config)) -> Editor {
+        let mut ed = editor("a.rs", tweak);
+        ed.lines = (0..n).map(|i| format!("line {i}")).collect();
+        ed
+    }
+
+    #[test]
+    fn scroll_off_keeps_context_around_the_cursor() {
+        let mut ed = tall(100, |c| c.editor.scroll_off = 3);
+        ed.cursor_row = 9;
+        ed.ensure_visible(80, 10);
+        assert_eq!(ed.scroll, 3, "cursor 3 lines from the bottom edge");
+
+        ed.cursor_row = 4;
+        ed.ensure_visible(80, 10);
+        assert_eq!(ed.scroll, 1, "cursor 3 lines from the top edge");
+
+        let mut plain = tall(100, |_| {});
+        plain.cursor_row = 9;
+        plain.ensure_visible(80, 10);
+        assert_eq!(
+            plain.scroll, 0,
+            "default: scroll only when the cursor leaves the screen"
+        );
+        plain.cursor_row = 10;
+        plain.ensure_visible(80, 10);
+        assert_eq!(plain.scroll, 1);
+    }
+
+    #[test]
+    fn scroll_off_never_exceeds_what_fits_on_screen() {
+        // A huge margin on a tiny window must not make the view jump around.
+        let mut ed = tall(100, |c| c.editor.scroll_off = 50);
+        ed.cursor_row = 20;
+        ed.ensure_visible(80, 5);
+        assert!(
+            ed.scroll <= 20 && 20 < ed.scroll + 5,
+            "cursor stays visible: scroll {}",
+            ed.scroll
+        );
+        let before = ed.scroll;
+        ed.ensure_visible(80, 5);
+        assert_eq!(ed.scroll, before, "stable when nothing changed");
+    }
+
+    #[test]
+    fn page_size_sets_how_far_page_keys_move() {
+        let mut screenful = tall(100, |_| {});
+        screenful.ensure_visible(80, 10);
+        screenful.page_down();
+        assert_eq!(screenful.cursor_row, 9, "a screenful less one line");
+        screenful.page_up();
+        assert_eq!(screenful.cursor_row, 0);
+
+        let mut fixed = tall(100, |c| c.editor.page_size = 5);
+        fixed.ensure_visible(80, 10);
+        fixed.page_down();
+        fixed.page_down();
+        assert_eq!(fixed.cursor_row, 10);
+        fixed.page_up();
+        assert_eq!(fixed.cursor_row, 5);
+    }
+
+    #[test]
+    fn word_chars_decide_where_words_end() {
+        let walk = |word_chars: &str| {
+            let word_chars = word_chars.to_string();
+            let mut ed = editor("a.txt", |c| c.editor.word_chars = word_chars);
+            ed.lines[0] = "foo-bar baz".to_string();
+            ed.cursor_col = 7; // right after "bar"
+            ed.move_word_left();
+            ed.cursor_col
+        };
+        assert_eq!(walk("_"), 4, "hyphen separates words by default");
+        assert_eq!(
+            walk("_-"),
+            0,
+            "with '-' as a word character, foo-bar is one word"
+        );
+
+        let mut ed = editor("a.txt", |c| c.editor.word_chars = "_-".into());
+        ed.lines[0] = "foo-bar baz".to_string();
+        ed.cursor_col = 0;
+        ed.move_word_right();
+        assert_eq!(ed.cursor_col, 7);
+        ed.cursor_col = 7;
+        ed.delete_word_backward();
+        assert_eq!(ed.lines[0], " baz", "word deletion uses it too");
+    }
+
+    #[test]
+    fn a_language_can_have_its_own_word_chars() {
+        let mut ed = editor("a.css", |c| {
+            c.languages.insert(
+                "css".into(),
+                LanguageOverride {
+                    word_chars: Some("_-".into()),
+                    ..Default::default()
+                },
+            );
+        });
+        ed.lines[0] = "font-size".to_string();
+        ed.cursor_col = 9;
+        ed.move_word_left();
+        assert_eq!(ed.cursor_col, 0);
+        let mut other = editor("a.rs", |_| {});
+        other.lines[0] = "font-size".to_string();
+        other.cursor_col = 9;
+        other.move_word_left();
+        assert_eq!(other.cursor_col, 5);
+    }
+
+    // ---- undo ----
+
+    #[test]
+    fn undo_limit_caps_how_many_steps_are_remembered() {
+        // Each of these breaks coalescing, so each is its own undo step.
+        let mut ed = editor("a.txt", |c| c.editor.undo_limit = 3);
+        for _ in 0..6 {
+            type_str(&mut ed, "x");
+            ed.move_left();
+            ed.move_right();
+        }
+        assert_eq!(ed.lines[0], "xxxxxx");
+        let mut undone = 0;
+        loop {
+            let before = ed.lines[0].clone();
+            ed.undo();
+            if ed.lines[0] == before {
+                break;
+            }
+            undone += 1;
+        }
+        assert_eq!(undone, 3, "only the last three steps can be undone");
+        assert_eq!(ed.lines[0], "xxx");
+
+        let mut roomy = editor("a.txt", |_| {});
+        for _ in 0..6 {
+            type_str(&mut roomy, "x");
+            roomy.move_left();
+            roomy.move_right();
+        }
+        for _ in 0..10 {
+            roomy.undo();
+        }
+        assert_eq!(roomy.lines[0], "");
+    }
+
+    // ---- saving ----
+
+    fn save_to_disk(
+        name: &str,
+        content: &str,
+        tweak: impl FnOnce(&mut Config),
+        edit: impl FnOnce(&mut Editor),
+    ) -> Vec<u8> {
+        let path = temp(name);
+        std::fs::write(&path, content).unwrap();
+        let mut config = Config::default();
+        tweak(&mut config);
+        let language = config.language_of(&path);
+        let settings = Settings::resolve(&config, language);
+        let mut ed = Editor::open_with(path.clone(), language, settings).unwrap();
+        edit(&mut ed);
+        assert!(ed.save());
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        bytes
+    }
+
+    #[test]
+    fn line_ending_auto_keeps_what_the_file_had() {
+        let touch = |ed: &mut Editor| ed.insert_char('!');
+        assert_eq!(
+            save_to_disk("le_auto_crlf.txt", "a\r\nb\r\n", |_| {}, touch),
+            b"!a\r\nb\r\n"
+        );
+        assert_eq!(
+            save_to_disk("le_auto_lf.txt", "a\nb\n", |_| {}, touch),
+            b"!a\nb\n"
+        );
+    }
+
+    #[test]
+    fn line_ending_can_be_forced() {
+        let touch = |ed: &mut Editor| ed.insert_char('!');
+        let to_lf = |c: &mut Config| c.files.line_ending = LineEnding::Lf;
+        let to_crlf = |c: &mut Config| c.files.line_ending = LineEnding::Crlf;
+        assert_eq!(
+            save_to_disk("le_lf.txt", "a\r\nb\r\n", to_lf, touch),
+            b"!a\nb\n"
+        );
+        assert_eq!(
+            save_to_disk("le_crlf.txt", "a\nb\n", to_crlf, touch),
+            b"!a\r\nb\r\n"
+        );
+    }
+
+    #[test]
+    fn insert_final_newline_controls_the_last_line_break() {
+        let touch = |ed: &mut Editor| ed.insert_char('!');
+        assert_eq!(save_to_disk("nl_on.txt", "a", |_| {}, touch), b"!a\n");
+        assert_eq!(
+            save_to_disk(
+                "nl_off.txt",
+                "a",
+                |c| c.files.insert_final_newline = false,
+                touch
+            ),
+            b"!a"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_cleans_lines_on_save_only_when_asked() {
+        let messy = "a  \n\tb\t \n   \nc\n";
+        let touch = |ed: &mut Editor| ed.insert_char('!');
+        assert_eq!(
+            save_to_disk("trim_off.txt", messy, |_| {}, touch),
+            b"!a  \n\tb\t \n   \nc\n"
+        );
+        assert_eq!(
+            save_to_disk(
+                "trim_on.txt",
+                messy,
+                |c| c.files.trim_trailing_whitespace = true,
+                touch
+            ),
+            b"!a\n\tb\n\nc\n"
+        );
+    }
+
+    #[test]
+    fn trimming_keeps_the_cursor_on_a_valid_column() {
+        let path = temp("trim_cursor.txt");
+        let mut config = Config::default();
+        config.files.trim_trailing_whitespace = true;
+        let language = config.language_of(&path);
+        let settings = Settings::resolve(&config, language);
+        let mut ed = Editor::open_with(path.clone(), language, settings).unwrap();
+        ed.lines = vec!["abc     ".to_string(), "x".to_string()];
+        ed.cursor_row = 0;
+        ed.cursor_col = 8;
+        ed.selection_anchor = Some((0, 7));
+        assert!(ed.save());
+        assert_eq!(ed.lines[0], "abc");
+        assert_eq!(ed.cursor_col, 3);
+        assert_eq!(ed.selection_anchor, Some((0, 3)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn per_language_save_settings_apply_only_to_that_language() {
+        let touch = |ed: &mut Editor| ed.insert_char('!');
+        let tweak = |c: &mut Config| {
+            c.languages.insert(
+                "markdown".into(),
+                LanguageOverride {
+                    trim_trailing_whitespace: Some(false),
+                    ..Default::default()
+                },
+            );
+            c.files.trim_trailing_whitespace = true;
+        };
+        // Markdown keeps its two-space hard line breaks; everything else is trimmed.
+        assert_eq!(
+            save_to_disk("lang_trim.md", "a  \nb\n", tweak, touch),
+            b"!a  \nb\n"
+        );
+        assert_eq!(
+            save_to_disk("lang_trim.txt", "a  \nb\n", tweak, touch),
+            b"!a\nb\n"
+        );
     }
 }

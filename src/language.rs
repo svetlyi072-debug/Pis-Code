@@ -5,7 +5,7 @@ use std::path::Path;
 
 /// How Enter splits an autoclosed bracket pair when the cursor sits
 /// between the two halves.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BraceSplit {
     /// No split: just the generic deepen-after-an-open-bracket rule. Used
     /// where `{}` is a data literal rather than a block (Python, GDScript).
@@ -35,7 +35,74 @@ pub enum Language {
     Other,
 }
 
+/// Every language, in the order they're documented.
+pub const ALL: &[Language] = &[
+    Language::CSharp,
+    Language::JavaScript,
+    Language::Rust,
+    Language::Python,
+    Language::GdScript,
+    Language::Html,
+    Language::Css,
+    Language::Json,
+    Language::Xml,
+    Language::Yaml,
+    Language::Markdown,
+    Language::Other,
+];
+
 impl Language {
+    /// The name used for this language in the config file
+    /// (`[languages.<id>]`, `[associations]`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Language::CSharp => "csharp",
+            Language::JavaScript => "javascript",
+            Language::Rust => "rust",
+            Language::Python => "python",
+            Language::GdScript => "gdscript",
+            Language::Html => "html",
+            Language::Css => "css",
+            Language::Json => "json",
+            Language::Xml => "xml",
+            Language::Yaml => "yaml",
+            Language::Markdown => "markdown",
+            Language::Other => "plain",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        ALL.iter().copied().find(|l| l.id() == id)
+    }
+
+    /// Like [`Language::from_path`], but first consults the user's
+    /// `[associations]`: an exact file name (`Jenkinsfile`) or an extension
+    /// without the dot (`vue`, case-insensitive) mapped to a language id.
+    /// An association naming an unknown language is ignored.
+    pub fn from_path_with(
+        path: &Path,
+        associations: &std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        let by_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| associations.get(n));
+        let by_ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .and_then(|e| {
+                associations
+                    .iter()
+                    .find(|(k, _)| k.trim_start_matches('.').eq_ignore_ascii_case(&e))
+                    .map(|(_, v)| v)
+            });
+        by_name
+            .or(by_ext)
+            .and_then(|id| Language::from_id(id))
+            .unwrap_or_else(|| Language::from_path(path))
+    }
+
     pub fn from_path(path: &Path) -> Self {
         let ext = path
             .extension()
@@ -105,8 +172,9 @@ impl Language {
         !matches!(self, Language::Rust | Language::Markdown)
     }
 
-    /// Typing `>` after an opening tag inserts the matching closing tag.
-    pub fn auto_closes_tags(self) -> bool {
+    /// Whether files of this type are made of tags (HTML, XML) — what tag
+    /// auto-closing and the Enter-between-tags split work on.
+    pub fn has_tags(self) -> bool {
         matches!(self, Language::Html | Language::Xml)
     }
 
@@ -164,5 +232,37 @@ mod tests {
         for p in ["App.csproj", "a.svg", "Main.xaml", "Directory.Build.props"] {
             assert!(lang(p) == Language::Xml, "{p}");
         }
+    }
+
+    #[test]
+    fn ids_round_trip() {
+        for &l in ALL {
+            assert!(Language::from_id(l.id()) == Some(l), "{}", l.id());
+        }
+        assert!(Language::from_id("cobol").is_none());
+    }
+
+    #[test]
+    fn associations_override_detection() {
+        let mut assoc = std::collections::BTreeMap::new();
+        assoc.insert("vue".to_string(), "html".to_string());
+        assoc.insert(".JSONC".to_string(), "json".to_string());
+        assoc.insert("Jenkinsfile".to_string(), "python".to_string());
+        assoc.insert("cs".to_string(), "plain".to_string()); // beats the built-in
+        assoc.insert("zzz".to_string(), "nonsense".to_string()); // ignored
+
+        let l = |p: &str| Language::from_path_with(Path::new(p), &assoc);
+        assert!(l("App.vue") == Language::Html);
+        assert!(
+            l("a/b/settings.jsonc") == Language::Json,
+            "leading dot and case ignored"
+        );
+        assert!(l("Jenkinsfile") == Language::Python, "exact file name");
+        assert!(l("Program.cs") == Language::Other, "user association wins");
+        assert!(
+            l("a.zzz") == Language::Other,
+            "unknown language id falls through"
+        );
+        assert!(l("a.rs") == Language::Rust, "unrelated files unaffected");
     }
 }
