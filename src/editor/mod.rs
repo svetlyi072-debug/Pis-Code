@@ -7,6 +7,9 @@ use anyhow::Result;
 use std::ops::Range;
 use std::path::PathBuf;
 
+pub mod search;
+pub use search::{Search, SearchStatus};
+
 /// What the file itself shows about its indentation: the first indented
 /// line decides tabs vs. spaces (a single leading space is ignored — that's
 /// usually the ` * ` of a block comment, not indentation); for spaces, the
@@ -145,6 +148,8 @@ pub struct Editor {
     pub file_path: PathBuf,
     pub language: Language,
     pub settings: Settings,
+    /// The find bar (Ctrl+F): its text, options and matches.
+    pub search: Search,
     /// One level of indentation, see [`choose_indent`].
     indent: String,
     /// Whether the file used CRLF line endings when it was loaded.
@@ -195,6 +200,7 @@ impl Editor {
             cursor_col: 0,
             file_path: path,
             language,
+            search: Search::new(&settings.search),
             settings,
             indent,
             file_crlf: loaded.crlf,
@@ -204,7 +210,7 @@ impl Editor {
             col_scroll: 0,
             confirm_quit: false,
             status_message: String::from(
-                "^S save  ^⇧S save+check  ^Q quit  ^Z undo  ^Y redo  ^A select all  ^C copy  ^X cut  ^V paste",
+                "^S save  ^⇧S save+check  ^Q quit  ^Z undo  ^Y redo  ^A select all  ^C copy  ^X cut  ^V paste  ^F find",
             ),
             status_is_error: false,
             selection_anchor: None,
@@ -336,6 +342,11 @@ impl Editor {
 
     /// Returns `(start, end)` in row-major order, or `None` if there is no
     /// active (non-empty) selection.
+    #[cfg(test)]
+    pub fn selection_bounds_for_test(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.selection_bounds()
+    }
+
     fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
         let anchor = self.selection_anchor?;
         let cursor = (self.cursor_row, self.cursor_col);
@@ -745,7 +756,9 @@ impl Editor {
         let between_brackets = match (before, after) {
             (Some('{'), Some('}')) => true,
             // Arrays split too, but only where `[]` is data (JSON).
-            (Some('['), Some(']')) => brace_split == BraceSplit::KAndR,
+            (Some('['), Some(']')) => {
+                brace_split == BraceSplit::KAndR && self.language.splits_square_brackets()
+            }
             _ => false,
         };
         let between_tags = smart
@@ -2619,6 +2632,105 @@ mod settings_tests {
             roomy.undo();
         }
         assert_eq!(roomy.lines[0], "");
+    }
+
+    // ---- the C family ----
+
+    #[test]
+    fn braces_split_allman_style_in_the_c_family() {
+        for file in [
+            "a.c", "a.cpp", "A.java", "a.php", "a.ts", "a.kt", "a.swift", "a.dart", "a.m",
+            "A.scala",
+        ] {
+            let mut ed = editor(file, |_| {});
+            type_str(&mut ed, "void f() {");
+            ed.newline();
+            assert_eq!(
+                ed.lines,
+                vec![
+                    "void f()".to_string(),
+                    "{".into(),
+                    ed.indent.clone(),
+                    "}".into()
+                ],
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_keeps_the_brace_on_the_line_and_indents_with_a_tab() {
+        let mut ed = editor("main.go", |_| {});
+        type_str(&mut ed, "func main() {");
+        ed.newline();
+        assert_eq!(ed.lines, vec!["func main() {", "\t", "}"]);
+        assert_eq!(ed.cursor_row, 1);
+        ed.insert_tab();
+        assert_eq!(ed.lines[1], "\t\t");
+
+        // `[]` is a type here, not an array literal: Enter doesn't split it.
+        let mut ed = editor("main.go", |_| {});
+        type_str(&mut ed, "x := [");
+        ed.newline();
+        assert_eq!(ed.lines.len(), 2, "{:?}", ed.lines);
+    }
+
+    #[test]
+    fn default_indent_follows_each_languages_convention() {
+        let indent_of = |file: &str| {
+            let mut ed = editor(file, |_| {});
+            ed.insert_tab();
+            ed.lines[0].clone()
+        };
+        assert_eq!(indent_of("a.go"), "\t");
+        assert_eq!(indent_of("a.dart"), "  ");
+        assert_eq!(indent_of("A.java"), "    ");
+        assert_eq!(indent_of("a.c"), "    ");
+    }
+
+    #[test]
+    fn a_c_file_keeps_its_tabs_when_it_is_indented_with_them() {
+        let mut ed = editor_with_content("tabs.c", "int main(void)\n{\n\treturn 0;\n}\n", |_| {});
+        ed.cursor_row = 2;
+        ed.cursor_col = ed.lines[2].chars().count();
+        ed.newline();
+        assert_eq!(ed.lines[3], "\t", "continues with the file's own tab");
+        ed.insert_tab();
+        assert_eq!(ed.lines[3], "\t\t", "and Tab adds another one, not spaces");
+    }
+
+    #[test]
+    fn char_literals_autoclose_in_c_but_swift_has_none() {
+        let mut c = editor("a.c", |_| {});
+        type_str(&mut c, "char c = '");
+        assert_eq!(c.lines[0], "char c = ''");
+        let mut swift = editor("a.swift", |_| {});
+        type_str(&mut swift, "let c = '");
+        assert_eq!(swift.lines[0], "let c = '");
+        // Double quotes still pair up in both.
+        let mut swift = editor("a.swift", |_| {});
+        type_str(&mut swift, "let s = \"");
+        assert_eq!(swift.lines[0], "let s = \"\"");
+    }
+
+    #[test]
+    fn an_association_can_make_a_header_cpp_or_borrow_a_language() {
+        let ed = editor("a.h", |_| {});
+        assert!(ed.language == Language::C, ".h is C by default");
+        let ed = editor("a.h", |c| {
+            c.associations.insert("h".into(), "cpp".into());
+        });
+        assert!(ed.language == Language::Cpp);
+        let ed = editor("shader.glsl", |c| {
+            c.associations.insert("glsl".into(), "c".into());
+        });
+        assert!(ed.language == Language::C);
+        let mut ed = editor("shader.glsl", |c| {
+            c.associations.insert("glsl".into(), "c".into());
+        });
+        type_str(&mut ed, "void main() {");
+        ed.newline();
+        assert_eq!(ed.lines.len(), 4, "gets the smart braces too");
     }
 
     // ---- saving ----

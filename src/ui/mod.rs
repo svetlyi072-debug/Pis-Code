@@ -1,6 +1,6 @@
 use crate::check::Severity;
 use crate::config::{SelectionStyle, StatusPosition, UiSettings};
-use crate::editor::{display_columns, Editor};
+use crate::editor::{display_columns, Editor, SearchStatus};
 use crate::syntax::Highlighter;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -91,10 +91,26 @@ pub fn draw(f: &mut Frame, editor: &mut Editor, highlighter: &Highlighter, ui: &
             let expanded = expand_tabs(row_spans, tab_width);
             let visible = slice_spans(&expanded, editor.col_scroll, content_width);
 
+            // Find-bar hits are painted first, so a selection or a
+            // diagnostic drawn over one still shows.
+            let hits: Vec<(Range<usize>, bool)> =
+                if editor.search.active && editor.settings.search.highlight_matches {
+                    let current = editor.search.current_match();
+                    editor
+                        .search
+                        .matches_in_row(file_row)
+                        .iter()
+                        .map(|m| (to_cell(m.start)..to_cell(m.end), Some(*m) == current))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let with_hits = apply_search_hits(visible, editor.col_scroll, &hits, ui);
+
             let sel = editor
                 .selection_col_range(file_row)
                 .map(|r| to_cell(r.start)..to_cell(r.end));
-            let with_selection = apply_selection(visible, editor.col_scroll, sel, ui.selection);
+            let with_selection = apply_selection(with_hits, editor.col_scroll, sel, ui.selection);
 
             let line_char_len = line.chars().count();
             let severities: HashMap<usize, Severity> = if ui.underline_diagnostics {
@@ -122,6 +138,11 @@ pub fn draw(f: &mut Frame, editor: &mut Editor, highlighter: &Highlighter, ui: &
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, text_area);
 
+    if editor.search.active {
+        let cursor_x = draw_find_bar(f, status_area, editor, ui);
+        f.set_cursor(cursor_x, status_area.y);
+        return;
+    }
     draw_status(f, status_area, editor, ui);
 
     let cursor_screen_row = editor.cursor_row - editor.scroll;
@@ -172,22 +193,38 @@ fn status_left(editor: &Editor, ui: &UiSettings) -> String {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, editor: &Editor, ui: &UiSettings) {
-    let left = status_left(editor, ui);
-    let right = editor.status_message.clone();
-
     let style = if editor.status_is_error {
-        Style::default()
-            .fg(ui.status_error_fg)
-            .bg(ui.status_error_bg)
-            .add_modifier(Modifier::BOLD)
+        error_status_style(ui)
     } else {
-        Style::default().fg(ui.status_fg).bg(ui.status_bg)
+        normal_status_style(ui)
     };
+    let text = status_line(
+        &status_left(editor, ui),
+        &editor.status_message,
+        area.width as usize,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, style))).style(style),
+        area,
+    );
+}
 
+fn normal_status_style(ui: &UiSettings) -> Style {
+    Style::default().fg(ui.status_fg).bg(ui.status_bg)
+}
+
+fn error_status_style(ui: &UiSettings) -> Style {
+    Style::default()
+        .fg(ui.status_error_fg)
+        .bg(ui.status_error_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// `left` at the start and `right` at the end of a line `width` cells wide.
+fn status_line(left: &str, right: &str, width: usize) -> String {
     // Widths are measured in characters, not bytes — status messages can
     // contain non-ASCII text (e.g. a localized compiler diagnostic), where
     // byte length and display width diverge.
-    let width = area.width as usize;
     let left_len = left.chars().count();
     let right_len = right.chars().count();
 
@@ -201,14 +238,72 @@ fn draw_status(f: &mut Frame, area: Rect, editor: &Editor, ui: &UiSettings) {
         1
     };
 
-    let mut text = left;
+    let mut text = left.to_string();
     text.push_str(&" ".repeat(sep));
-    text.push_str(&right);
+    text.push_str(right);
     text.push(' ');
-    let text: String = text.chars().take(width).collect();
+    text.chars().take(width).collect()
+}
 
-    let paragraph = Paragraph::new(Line::from(Span::styled(text, style))).style(style);
-    f.render_widget(paragraph, area);
+/// The find bar, in place of the status bar: the text being searched for,
+/// then how many hits there are and which options are on. Returns the
+/// column for the terminal cursor (just after the text).
+fn draw_find_bar(f: &mut Frame, area: Rect, editor: &Editor, ui: &UiSettings) -> u16 {
+    let search = &editor.search;
+    let (info, is_error) = match search.status() {
+        SearchStatus::Empty => (String::new(), false),
+        SearchStatus::NoResults => ("No results".to_string(), true),
+        SearchStatus::NoMoreResults => ("No more results".to_string(), false),
+        SearchStatus::Found {
+            index,
+            total,
+            truncated,
+        } => (
+            format!("{index} of {total}{}", if truncated { "+" } else { "" }),
+            false,
+        ),
+        SearchStatus::Pending { total, truncated } => (
+            format!(
+                "{total}{} found - Enter to go",
+                if truncated { "+" } else { "" }
+            ),
+            false,
+        ),
+        SearchStatus::Invalid(why) => (format!("Invalid regex: {why}"), true),
+    };
+    // [Aa] case-sensitive, [W] whole word, [.*] regex: bracketed when on.
+    let flag = |label: &str, on: bool| {
+        if on {
+            format!("[{label}]")
+        } else {
+            format!(" {label} ")
+        }
+    };
+    let flags = format!(
+        "{} {} {}",
+        flag("Aa", editor.search_case_sensitive()),
+        flag("W", search.whole_word),
+        flag(".*", search.regex)
+    );
+    let left = format!(" Find: {}", search.query);
+    let right = format!("{info}  {flags}  Enter/Down next  Up prev  Esc close");
+
+    let style = if is_error {
+        error_status_style(ui)
+    } else {
+        normal_status_style(ui)
+    };
+    let text = status_line(&left, right.trim_start(), area.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, style))).style(style),
+        area,
+    );
+
+    let end = left
+        .chars()
+        .count()
+        .min(area.width.saturating_sub(1) as usize);
+    area.x + end as u16
 }
 
 /// Replaces each tab with the spaces that reach the next tab stop, so the
@@ -310,6 +405,60 @@ fn apply_selection<'a>(
                 style,
                 (buf_selected == Some(true)).then_some(style_of_selection),
             );
+        }
+    }
+    result
+}
+
+/// Gives the cells of each find-bar hit (`true` marks the current one) a
+/// background so the matches stand out.
+fn apply_search_hits<'a>(
+    spans: Vec<Span<'a>>,
+    col_scroll: usize,
+    hits: &[(Range<usize>, bool)],
+    ui: &UiSettings,
+) -> Vec<Span<'a>> {
+    if hits.is_empty() {
+        return spans;
+    }
+    let state_at = |col: usize| {
+        hits.iter()
+            .find(|(range, _)| range.contains(&col))
+            .map(|(_, current)| *current)
+    };
+
+    let mut result = Vec::new();
+    let mut abs_col = col_scroll;
+    for span in spans {
+        let style = span.style;
+        let text = span.content.into_owned();
+        let mut buf = String::new();
+        let mut buf_state: Option<Option<bool>> = None;
+
+        let flush = |result: &mut Vec<Span<'a>>, buf: &str, state: Option<bool>| {
+            let styled = match state {
+                None => style,
+                Some(false) => style.bg(ui.search_match),
+                Some(true) => style.bg(ui.search_current).fg(ui.search_current_text),
+            };
+            result.push(Span::styled(buf.to_string(), styled));
+        };
+        for ch in text.chars() {
+            let state = state_at(abs_col);
+            if let Some(prev) = buf_state {
+                if prev != state {
+                    flush(&mut result, &buf, prev);
+                    buf.clear();
+                }
+            }
+            buf_state = Some(state);
+            buf.push(ch);
+            abs_col += 1;
+        }
+        if let Some(prev) = buf_state {
+            if !buf.is_empty() {
+                flush(&mut result, &buf, prev);
+            }
         }
     }
     result
@@ -744,5 +893,165 @@ mod tests {
         let (_, cursor) = render(&mut ed, &UiSettings::default(), 40, 3);
         assert!(cursor.0 < 40, "{cursor:?}");
         assert_eq!(cursor.1, 0);
+    }
+
+    // ---- the find bar ----
+
+    fn searching(lines: &[&str], query: &str) -> Editor {
+        let mut ed = editor_with(lines);
+        ed.open_search();
+        for c in query.chars() {
+            ed.search_insert(c);
+        }
+        ed
+    }
+
+    #[test]
+    fn the_find_bar_replaces_the_status_bar_and_holds_the_cursor() {
+        let mut ed = searching(&["foo bar foo"], "foo");
+        let (buf, cursor) = render(&mut ed, &UiSettings::default(), 100, 5);
+        let bar = row(&buf, 4);
+        assert!(bar.starts_with(" Find: foo"), "{bar:?}");
+        assert!(bar.contains("1 of 2"), "{bar:?}");
+        assert!(bar.contains("Esc close"), "{bar:?}");
+        assert!(
+            !bar.contains("a.txt") && !bar.contains("Ln "),
+            "no file info while finding: {bar:?}"
+        );
+        assert_eq!(
+            cursor,
+            (" Find: foo".chars().count() as u16, 4),
+            "cursor is in the bar"
+        );
+        assert_eq!(
+            buf.get(0, 4).bg,
+            Color::Rgb(0x7a, 0xa2, 0xf7),
+            "normal status colors"
+        );
+    }
+
+    #[test]
+    fn closing_the_bar_brings_the_status_bar_back() {
+        let mut ed = searching(&["foo"], "foo");
+        ed.close_search();
+        let (buf, cursor) = render(&mut ed, &UiSettings::default(), 60, 5);
+        assert!(row(&buf, 4).contains("Ln 1, Col"), "{:?}", row(&buf, 4));
+        assert!(cursor.1 < 4, "cursor back in the text: {cursor:?}");
+        assert_eq!(buf.get(5, 0).bg, Color::Reset, "no hit highlighting");
+    }
+
+    #[test]
+    fn option_flags_are_bracketed_when_on() {
+        let mut ed = searching(&["Foo foo"], "foo");
+        let flags = |ed: &mut Editor| {
+            let (buf, _) = render(ed, &UiSettings::default(), 120, 4);
+            let bar = row(&buf, 3);
+            let at = bar.find("Aa").expect("flags are shown") - 1;
+            bar[at..at + 14].trim_end().to_string()
+        };
+        assert_eq!(flags(&mut ed), " Aa   W   .*");
+        ed.search_toggle_case();
+        assert_eq!(flags(&mut ed), "[Aa]  W   .*");
+        ed.search_toggle_whole_word();
+        ed.search_toggle_regex();
+        assert_eq!(flags(&mut ed), "[Aa] [W] [.*]");
+    }
+
+    #[test]
+    fn no_results_and_bad_patterns_turn_the_bar_red() {
+        let ui = UiSettings::default();
+        let mut ed = searching(&["abc"], "zzz");
+        let (buf, _) = render(&mut ed, &ui, 100, 4);
+        assert!(row(&buf, 3).contains("No results"));
+        assert_eq!(buf.get(0, 3).bg, Color::Rgb(0x8b, 0x2f, 0x2f));
+
+        let mut ed = editor_with(&["abc"]);
+        ed.open_search();
+        ed.search_toggle_regex();
+        ed.search_insert('(');
+        let (buf, _) = render(&mut ed, &ui, 100, 4);
+        assert!(row(&buf, 3).contains("Invalid regex"), "{:?}", row(&buf, 3));
+        assert_eq!(buf.get(0, 3).bg, Color::Rgb(0x8b, 0x2f, 0x2f));
+    }
+
+    #[test]
+    fn hits_are_highlighted_and_the_current_one_stands_out() {
+        let mut ed = searching(&["foo bar foo"], "foo");
+        let (buf, _) = render(&mut ed, &UiSettings::default(), 60, 4);
+        let (current, other, plain) = (
+            Color::Rgb(0xf0, 0xa0, 0x30),
+            Color::Rgb(0x58, 0x51, 0x1f),
+            Color::Reset,
+        );
+        // Gutter is 4 cells wide.
+        for x in 4..7 {
+            assert_eq!(buf.get(x, 0).bg, current, "current hit, cell {x}");
+            assert_eq!(buf.get(x, 0).fg, Color::Black, "its text color");
+        }
+        assert_eq!(buf.get(7, 0).bg, plain, "the space after it");
+        for x in 12..15 {
+            assert_eq!(buf.get(x, 0).bg, other, "other hit, cell {x}");
+        }
+
+        ed.search_next();
+        let (buf, _) = render(&mut ed, &UiSettings::default(), 60, 4);
+        assert_eq!(buf.get(4, 0).bg, other, "the highlight moved on");
+        assert_eq!(buf.get(12, 0).bg, current);
+    }
+
+    #[test]
+    fn hit_colors_and_highlighting_follow_the_config() {
+        let ui = ui_with(|c| {
+            c.colors.search_match = "#010203".into();
+            c.colors.search_current = "#040506".into();
+            c.colors.search_current_text = "white".into();
+        });
+        let mut ed = searching(&["foo foo"], "foo");
+        let (buf, _) = render(&mut ed, &ui, 60, 4);
+        assert_eq!(buf.get(4, 0).bg, Color::Rgb(4, 5, 6));
+        assert_eq!(buf.get(4, 0).fg, Color::White);
+        assert_eq!(buf.get(8, 0).bg, Color::Rgb(1, 2, 3));
+
+        let mut ed = searching(&["foo foo"], "foo");
+        ed.settings.search.highlight_matches = false;
+        let (buf, _) = render(&mut ed, &UiSettings::default(), 60, 4);
+        assert_eq!(buf.get(4, 0).bg, Color::Reset, "highlighting switched off");
+        assert!(row(&buf, 3).contains("1 of 2"), "the bar still counts");
+    }
+
+    #[test]
+    fn hits_line_up_after_tabs_and_wide_scrolls() {
+        let mut ed = searching(&["\tfoo"], "foo");
+        let (buf, _) = render(&mut ed, &UiSettings::default(), 60, 4);
+        // 4-cell gutter + a 4-cell tab, then the hit.
+        assert_eq!(buf.get(8, 0).symbol(), "f");
+        assert_eq!(buf.get(8, 0).bg, Color::Rgb(0xf0, 0xa0, 0x30));
+        assert_eq!(
+            buf.get(7, 0).bg,
+            Color::Reset,
+            "the tab itself is not part of the hit"
+        );
+    }
+
+    #[test]
+    fn the_find_bar_follows_the_status_bar_position() {
+        let ui = ui_with(|c| c.status_bar.position = StatusPosition::Top);
+        let mut ed = searching(&["foo"], "foo");
+        let (buf, cursor) = render(&mut ed, &ui, 60, 5);
+        assert!(row(&buf, 0).starts_with(" Find: foo"), "{:?}", row(&buf, 0));
+        assert_eq!(cursor.1, 0);
+        assert!(row(&buf, 1).starts_with("  1 foo"));
+    }
+
+    #[test]
+    fn a_narrow_terminal_still_shows_the_text_and_keeps_the_cursor_inside() {
+        let mut ed = searching(&["abc"], "a rather long search text");
+        let (buf, cursor) = render(&mut ed, &UiSettings::default(), 20, 4);
+        assert!(
+            row(&buf, 3).starts_with(" Find: a rather long"),
+            "{:?}",
+            row(&buf, 3)
+        );
+        assert!(cursor.0 < 20, "{cursor:?}");
     }
 }

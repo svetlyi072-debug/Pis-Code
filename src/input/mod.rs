@@ -20,6 +20,14 @@ pub fn handle_key(
 ) -> Outcome {
     let resolved = keymap.resolve(&key);
 
+    // The find bar takes the keyboard while it is open; any key that is
+    // not for the bar closes it and is then handled as usual.
+    if editor.search.active {
+        if let Some(outcome) = handle_search_key(editor, &key, resolved) {
+            return outcome;
+        }
+    }
+
     // While a "quit with unsaved changes?" prompt is showing, only quit,
     // save and Esc mean anything.
     if editor.confirm_quit {
@@ -115,9 +123,58 @@ pub fn handle_key(
         Action::WordLeft => editor.move_word_left(),
         Action::WordRight if select => editor.move_word_right_select(),
         Action::WordRight => editor.move_word_right(),
+        Action::Find => editor.open_search(),
+        Action::FindNext => editor.search_next(),
+        Action::FindPrevious => editor.search_prev(),
+        // These only mean something inside the bar.
+        Action::FindToggleCase | Action::FindToggleWholeWord | Action::FindToggleRegex => {}
     }
 
     Outcome::Continue
+}
+
+/// A key pressed while the find bar is open. Returns `None` when the key
+/// isn't for the bar: the bar has then been closed (leaving the current
+/// match selected) and the caller carries on handling the key.
+fn handle_search_key(
+    editor: &mut Editor,
+    key: &KeyEvent,
+    resolved: Option<(Action, bool)>,
+) -> Option<Outcome> {
+    match resolved {
+        // Enter goes to the next match, Shift+Enter to the previous one.
+        Some((Action::Newline, _)) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            editor.search_prev()
+        }
+        Some((Action::Newline | Action::MoveDown | Action::FindNext, false)) => {
+            editor.search_next()
+        }
+        Some((Action::MoveUp | Action::FindPrevious, false)) => editor.search_prev(),
+        Some((Action::Backspace, _)) => editor.search_backspace(),
+        Some((Action::DeleteWordBackward, _)) => editor.search_delete_word(),
+        Some((Action::Paste, _)) => editor.search_paste(),
+        Some((Action::Find, _)) => editor.open_search(),
+        Some((Action::FindToggleCase, _)) => editor.search_toggle_case(),
+        Some((Action::FindToggleWholeWord, _)) => editor.search_toggle_whole_word(),
+        Some((Action::FindToggleRegex, _)) => editor.search_toggle_regex(),
+        Some(_) => {
+            editor.close_search();
+            return None;
+        }
+        None => match key.code {
+            KeyCode::Esc => editor.close_search(),
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.search_insert(c)
+            }
+            // Anything else the bar doesn't know is ignored.
+            _ => {}
+        },
+    }
+    Some(Outcome::Continue)
 }
 
 /// The "unsaved changes" prompt, naming the keys as they're really bound.
@@ -355,6 +412,193 @@ mod tests {
             ),
             Outcome::Quit
         ));
+    }
+
+    #[test]
+    fn shortcuts_work_on_the_russian_layout_and_russian_text_still_types() {
+        let path = std::env::temp_dir().join(format!("pc_input_ru_{}.txt", std::process::id()));
+        let mut ed = Editor::open(path.clone()).unwrap();
+        for c in "привет".chars() {
+            handle(&mut ed, press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        handle(&mut ed, press(KeyCode::Char('П'), KeyModifiers::SHIFT));
+        assert_eq!(ed.lines[0], "приветП", "Cyrillic typing is untouched");
+
+        // Ctrl+Я undoes (Ctrl+Z on the US layout), Ctrl+Н redoes (Ctrl+Y).
+        handle(&mut ed, ctrl('я'));
+        assert_eq!(ed.lines[0], "");
+        handle(&mut ed, ctrl('н'));
+        assert_eq!(ed.lines[0], "приветП");
+        // Ctrl+Ц deletes a word (Ctrl+W), Ctrl+Ы saves (Ctrl+S).
+        handle(&mut ed, ctrl('ц'));
+        assert_eq!(ed.lines[0], "");
+        handle(&mut ed, ctrl('ы'));
+        assert!(!ed.modified, "saved");
+        // Ctrl+Й quits (Ctrl+Q); an unbound Ctrl+letter types nothing.
+        handle(&mut ed, ctrl('ж'));
+        assert_eq!(ed.lines[0], "");
+        assert!(matches!(handle(&mut ed, ctrl('й')), Outcome::Quit));
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- the find bar ----
+
+    fn type_text(ed: &mut Editor, text: &str) {
+        for c in text.chars() {
+            handle(ed, press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn doc(lines: &[&str]) -> Editor {
+        let mut ed = Editor::open(PathBuf::from("__input_find__.txt")).unwrap();
+        ed.lines = lines.iter().map(|l| l.to_string()).collect();
+        ed
+    }
+
+    #[test]
+    fn ctrl_f_opens_the_bar_and_typing_goes_into_it_not_the_buffer() {
+        let mut ed = doc(&["hello world", "world"]);
+        handle(&mut ed, ctrl('f'));
+        assert!(ed.search.active);
+        type_text(&mut ed, "world");
+        assert_eq!(ed.search.query, "world");
+        assert_eq!(
+            ed.lines,
+            vec!["hello world", "world"],
+            "the buffer is untouched"
+        );
+        assert_eq!(
+            (ed.cursor_row, ed.cursor_col),
+            (0, 6),
+            "jumped to the first match"
+        );
+        assert!(!ed.modified);
+    }
+
+    #[test]
+    fn enter_and_shift_enter_and_the_arrows_step_through_matches() {
+        let mut ed = doc(&["x1 x2 x3"]);
+        handle(&mut ed, ctrl('f'));
+        type_text(&mut ed, "x");
+        let col = |ed: &Editor| ed.cursor_col;
+        assert_eq!(col(&ed), 0);
+        handle(&mut ed, press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(col(&ed), 3);
+        handle(&mut ed, press(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(col(&ed), 6);
+        handle(&mut ed, press(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(col(&ed), 3);
+        handle(&mut ed, press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(col(&ed), 0);
+        handle(&mut ed, press(KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(col(&ed), 3);
+        handle(&mut ed, press(KeyCode::F(3), KeyModifiers::SHIFT));
+        assert_eq!(col(&ed), 0);
+        assert!(ed.search.active, "stepping keeps the bar open");
+    }
+
+    #[test]
+    fn escape_closes_the_bar_and_leaves_the_match_selected_to_type_over() {
+        let mut ed = doc(&["say hello there"]);
+        handle(&mut ed, ctrl('f'));
+        type_text(&mut ed, "hello");
+        handle(&mut ed, press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!ed.search.active);
+        assert!(ed.has_selection());
+        type_text(&mut ed, "bye");
+        assert_eq!(
+            ed.lines[0], "say bye there",
+            "typing now replaces the match"
+        );
+    }
+
+    #[test]
+    fn keys_that_are_not_for_the_bar_close_it_and_act_normally() {
+        // Moving the cursor.
+        let mut ed = doc(&["abc abc"]);
+        handle(&mut ed, ctrl('f'));
+        type_text(&mut ed, "abc");
+        handle(&mut ed, press(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!ed.search.active);
+        // Saving.
+        let path = std::env::temp_dir().join(format!("pc_input_find_{}.txt", std::process::id()));
+        let mut ed = Editor::open(path.clone()).unwrap();
+        ed.lines = vec!["find me".to_string()];
+        ed.modified = true;
+        handle(&mut ed, ctrl('f'));
+        type_text(&mut ed, "me");
+        handle(&mut ed, ctrl('s'));
+        assert!(!ed.search.active && !ed.modified, "closed, then saved");
+        // Quitting asks about unsaved changes as usual.
+        ed.insert_char('!');
+        handle(&mut ed, ctrl('f'));
+        assert!(matches!(handle(&mut ed, ctrl('q')), Outcome::Continue));
+        assert!(!ed.search.active && ed.confirm_quit);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn backspace_ctrl_backspace_and_paste_edit_the_search_text() {
+        let mut ed = doc(&["bar", "ignored"]);
+        ed.select_all();
+        ed.copy(); // the clipboard now holds "bar\nignored"
+        handle(&mut ed, ctrl('f'));
+        type_text(&mut ed, "foo bar");
+        handle(&mut ed, press(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(ed.search.query, "foo ba");
+        handle(&mut ed, press(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(ed.search.query, "foo ");
+        handle(&mut ed, ctrl('v'));
+        assert_eq!(ed.search.query, "foo bar", "only the first clipboard line");
+        assert_eq!(
+            ed.lines,
+            vec!["bar", "ignored"],
+            "nothing was pasted into the buffer"
+        );
+    }
+
+    #[test]
+    fn alt_keys_toggle_case_whole_word_and_regex() {
+        let mut ed = doc(&["Cat cat concat"]);
+        handle(&mut ed, ctrl('f'));
+        type_text(&mut ed, "cat");
+        assert_eq!(
+            ed.search.total(),
+            4 - 1,
+            "smart case: lowercase text ignores case"
+        );
+        handle(&mut ed, press(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert_eq!(ed.search.total(), 2, "Alt+C: now case-sensitive");
+        handle(&mut ed, press(KeyCode::Char('w'), KeyModifiers::ALT));
+        assert_eq!(ed.search.total(), 1, "Alt+W: whole words only");
+        handle(&mut ed, press(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(ed.search.regex, "Alt+R");
+        assert_eq!(
+            ed.lines[0], "Cat cat concat",
+            "the keys did not type anything"
+        );
+    }
+
+    #[test]
+    fn find_works_on_the_russian_layout_too() {
+        let mut ed = doc(&["один два"]);
+        handle(&mut ed, ctrl('а')); // Ctrl+А is Ctrl+F
+        assert!(ed.search.active);
+        type_text(&mut ed, "два");
+        assert_eq!(ed.cursor_col, 5);
+        handle(&mut ed, press(KeyCode::Char('с'), KeyModifiers::ALT)); // Alt+С is Alt+C
+        assert!(ed.search_case_sensitive());
+    }
+
+    #[test]
+    fn f3_without_the_bar_steps_through_the_last_search() {
+        let mut ed = doc(&["a x", "b x"]);
+        handle(&mut ed, ctrl('f'));
+        type_text(&mut ed, "x");
+        handle(&mut ed, press(KeyCode::Esc, KeyModifiers::NONE));
+        handle(&mut ed, press(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(!ed.search.active);
+        assert_eq!(ed.selection_bounds_for_test(), Some(((1, 2), (1, 3))));
     }
 
     #[test]

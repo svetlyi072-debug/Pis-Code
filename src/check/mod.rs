@@ -45,6 +45,9 @@ pub struct CheckOptions {
     /// `auto` (match the installed SDK) or a target framework like `net8.0`.
     pub dotnet_target_framework: String,
     pub rust_edition: String,
+    /// Extra arguments for the C / C++ compiler.
+    pub c_flags: Vec<String>,
+    pub cpp_flags: Vec<String>,
 }
 
 impl CheckOptions {
@@ -54,6 +57,8 @@ impl CheckOptions {
             timeout: Duration::from_secs(config.check.timeout_seconds.max(1)),
             dotnet_target_framework: config.check.dotnet_target_framework.trim().to_string(),
             rust_edition: config.check.rust_edition.trim().to_string(),
+            c_flags: config.check.c_flags.clone(),
+            cpp_flags: config.check.cpp_flags.clone(),
         }
     }
 }
@@ -119,6 +124,14 @@ impl Checker {
 fn run_check(file_path: &Path, language: Language, options: &CheckOptions) -> CheckMessage {
     match language {
         Language::CSharp => run_check_csharp(file_path, options),
+        Language::C => run_check_c_family(file_path, options, false),
+        Language::Cpp => run_check_c_family(file_path, options, true),
+        Language::Java => run_check_java(file_path, options),
+        Language::Go => run_check_go(file_path, options),
+        Language::Php => run_check_php(file_path, options),
+        Language::TypeScript => run_check_typescript(file_path, options),
+        Language::Kotlin => run_check_kotlin(file_path, options),
+        Language::Swift => run_check_swift(file_path, options),
         Language::Rust => run_check_rust(file_path, options),
         Language::JavaScript => run_check_javascript(file_path, options),
         Language::Python => run_check_python(file_path, options),
@@ -127,7 +140,12 @@ fn run_check(file_path: &Path, language: Language, options: &CheckOptions) -> Ch
         Language::Xml => run_check_markup(file_path, false),
         Language::Json => run_check_json(file_path),
         Language::Yaml => run_check_yaml(file_path),
-        Language::Css | Language::Markdown | Language::Other => {
+        Language::Css
+        | Language::Markdown
+        | Language::ObjectiveC
+        | Language::Dart
+        | Language::Scala
+        | Language::Other => {
             CheckMessage::Failed("No checker available for this file type".to_string())
         }
     }
@@ -398,6 +416,12 @@ fn stable_temp_dir(absolute_file: &Path) -> PathBuf {
 }
 
 fn parse_csharp_diagnostics(output: &str, file_path: &Path) -> Vec<Diagnostic> {
+    parse_paren_diagnostics(output, file_path, true)
+}
+
+/// MSBuild and `tsc` both print `path(line,col): error CODE: message`.
+/// MSBuild appends ` [project.csproj]`, which `strip_project` removes.
+fn parse_paren_diagnostics(output: &str, file_path: &Path, strip_project: bool) -> Vec<Diagnostic> {
     let re = Regex::new(r"^(?P<file>.+)\((?P<line>\d+),(?P<col>\d+)\): (?P<sev>error|warning) (?P<code>[A-Za-z0-9]+): (?P<msg>.*)$")
         .expect("static regex is valid");
 
@@ -420,9 +444,11 @@ fn parse_csharp_diagnostics(output: &str, file_path: &Path) -> Vec<Diagnostic> {
         };
 
         let mut message = caps["msg"].to_string();
-        if let Some(idx) = message.rfind(" [") {
-            if message.ends_with(']') {
-                message.truncate(idx);
+        if strip_project {
+            if let Some(idx) = message.rfind(" [") {
+                if message.ends_with(']') {
+                    message.truncate(idx);
+                }
             }
         }
 
@@ -435,6 +461,335 @@ fn parse_csharp_diagnostics(output: &str, file_path: &Path) -> Vec<Diagnostic> {
         });
     }
     diagnostics
+}
+
+// ==================== C, C++ (compiler, syntax-only) ====================
+
+/// A diagnostic's file as the compiler printed it, resolved against the
+/// directory the compiler ran in.
+fn printed_path(base_dir: &Path, printed: &str) -> PathBuf {
+    base_dir.join(printed.strip_prefix("vet: ").unwrap_or(printed))
+}
+
+fn absolute_path(file_path: &Path) -> PathBuf {
+    std::fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf())
+}
+
+/// Asks tools that translate their messages (gcc, javac, ...) for English,
+/// since the parsers below look for the words `error` and `warning`.
+fn in_english(command: &mut Command) -> &mut Command {
+    command.env("LC_ALL", "C").env("LANGUAGE", "C")
+}
+
+fn run_check_c_family(file_path: &Path, options: &CheckOptions, cpp: bool) -> CheckMessage {
+    let (configured, candidates, flags, language) = if cpp {
+        (
+            &options.tools.cxx,
+            ["c++", "g++", "clang++"],
+            &options.cpp_flags,
+            "c++",
+        )
+    } else {
+        (
+            &options.tools.cc,
+            ["cc", "gcc", "clang"],
+            &options.c_flags,
+            "c",
+        )
+    };
+    let compiler = if configured.is_empty() {
+        match first_available(&candidates, options) {
+            Some(found) => found,
+            None => return CheckMessage::ToolMissing(candidates[0].to_string()),
+        }
+    } else {
+        configured.clone()
+    };
+
+    // `-x` pins the language, so a `.h` associated with C++ is checked as C++.
+    let absolute = absolute_path(file_path);
+    let dir = absolute.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let output = match run_tool(
+        &compiler,
+        in_english(Command::new(&compiler).current_dir(&dir))
+            .args(["-fsyntax-only", "-Wall", "-fdiagnostics-color=never"])
+            .args(flags)
+            .args(["-x", language])
+            .arg(&absolute),
+        options,
+    ) {
+        Ok(o) => o,
+        Err(msg) => return msg,
+    };
+    CheckMessage::Finished(parse_colon_diagnostics(
+        &combined_output(&output),
+        &dir,
+        file_path,
+    ))
+}
+
+/// The `path:line:col: severity: message` shape shared by gcc, clang,
+/// kotlinc, swiftc and Go. Go prints no severity (every line is an error),
+/// gcc/clang add `note:` lines that only elaborate on the previous one.
+fn parse_colon_diagnostics(output: &str, base_dir: &Path, file_path: &Path) -> Vec<Diagnostic> {
+    let re = Regex::new(
+        r"^(?P<file>.+?):(?P<line>\d+):(?:(?P<col>\d+):)?\s*(?:(?P<sev>fatal error|error|warning|note|remark)\s*:\s*)?(?P<msg>.+)$",
+    )
+    .expect("static regex is valid");
+    let option_re = Regex::new(r"^(?P<msg>.*\S)\s+\[(?P<code>-W[\w+=-]+)\]$").expect("valid regex");
+
+    let mut diagnostics = Vec::new();
+    for line in output.lines() {
+        let Some(caps) = re.captures(line.trim_end()) else {
+            continue;
+        };
+        let severity = match caps.name("sev").map(|m| m.as_str()) {
+            Some("note" | "remark") => continue,
+            Some("warning") => Severity::Warning,
+            _ => Severity::Error,
+        };
+        if !matches_target_file(&printed_path(base_dir, &caps["file"]), file_path) {
+            continue;
+        }
+
+        let mut message = caps["msg"].trim().to_string();
+        // gcc/clang tag warnings with the option that produced them.
+        let mut code = String::new();
+        if let Some(c) = option_re.captures(&message.clone()) {
+            code = c["code"].to_string();
+            message = c["msg"].to_string();
+        }
+        // A header checked on its own always trips this one (worded
+        // differently, and given an option name, by newer compilers).
+        if code == "-Wpragma-once-outside-header"
+            || (message.contains("#pragma once") && message.contains("in main file"))
+        {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic {
+            line: caps["line"].parse::<usize>().unwrap_or(1).saturating_sub(1),
+            col: caps
+                .name("col")
+                .and_then(|c| c.as_str().parse::<usize>().ok())
+                .unwrap_or(1)
+                .saturating_sub(1),
+            severity,
+            code,
+            message,
+        });
+    }
+    diagnostics
+}
+
+// ==================== Java (javac) ====================
+
+fn run_check_java(file_path: &Path, options: &CheckOptions) -> CheckMessage {
+    let javac = options.tools.javac.as_str();
+    let absolute = absolute_path(file_path);
+    let dir = absolute.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // Compiled classes go to a scratch folder instead of next to the source.
+    let out_dir = stable_temp_dir(&absolute);
+    let output = match run_tool(
+        javac,
+        in_english(Command::new(javac).current_dir(&dir))
+            .arg("-d")
+            .arg(&out_dir)
+            .arg(&absolute),
+        options,
+    ) {
+        Ok(o) => o,
+        Err(msg) => return msg,
+    };
+    CheckMessage::Finished(parse_javac_diagnostics(
+        &combined_output(&output),
+        &dir,
+        file_path,
+    ))
+}
+
+/// javac prints `path:line: error: message`, the source line, then a line
+/// with a caret under the problem — the caret gives the column.
+fn parse_javac_diagnostics(output: &str, base_dir: &Path, file_path: &Path) -> Vec<Diagnostic> {
+    let re = Regex::new(r"^(?P<file>.+?):(?P<line>\d+): (?P<sev>error|warning): (?P<msg>.*)$")
+        .expect("static regex is valid");
+    let lines: Vec<&str> = output.lines().collect();
+
+    let mut diagnostics = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(caps) = re.captures(line.trim_end()) else {
+            continue;
+        };
+        if !matches_target_file(&printed_path(base_dir, &caps["file"]), file_path) {
+            continue;
+        }
+        let col = lines[i + 1..(i + 4).min(lines.len())]
+            .iter()
+            .find(|l| l.trim() == "^")
+            .and_then(|l| l.find('^'))
+            .unwrap_or(0);
+
+        // Lint warnings are tagged `[unchecked]`, `[deprecation]`, ...
+        let mut message = caps["msg"].to_string();
+        let mut code = String::new();
+        if let Some(rest) = message.strip_prefix('[') {
+            if let Some((tag, text)) = rest.split_once("] ") {
+                code = tag.to_string();
+                message = text.to_string();
+            }
+        }
+        diagnostics.push(Diagnostic {
+            line: caps["line"].parse::<usize>().unwrap_or(1).saturating_sub(1),
+            col,
+            severity: if &caps["sev"] == "error" {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
+            code,
+            message,
+        });
+    }
+    diagnostics
+}
+
+// ==================== Go (go vet) ====================
+
+fn run_check_go(file_path: &Path, options: &CheckOptions) -> CheckMessage {
+    let go = options.tools.go.as_str();
+    let absolute = absolute_path(file_path);
+    let dir = absolute.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // Inside a module the whole package is checked, so the file can use
+    // its neighbors; a loose file is checked alone.
+    let in_module = find_ancestor_file(&absolute, |p| {
+        p.file_name().and_then(|n| n.to_str()) == Some("go.mod")
+    })
+    .is_some();
+    let target = if in_module {
+        ".".to_string()
+    } else {
+        absolute
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let output = match run_tool(
+        go,
+        Command::new(go).current_dir(&dir).arg("vet").arg(target),
+        options,
+    ) {
+        Ok(o) => o,
+        Err(msg) => return msg,
+    };
+    CheckMessage::Finished(parse_colon_diagnostics(
+        &combined_output(&output),
+        &dir,
+        file_path,
+    ))
+}
+
+// ==================== PHP (php -l) ====================
+
+fn run_check_php(file_path: &Path, options: &CheckOptions) -> CheckMessage {
+    let php = options.tools.php.as_str();
+    let output = match run_tool(
+        php,
+        Command::new(php).arg("-l").arg(absolute_path(file_path)),
+        options,
+    ) {
+        Ok(o) => o,
+        Err(msg) => return msg,
+    };
+    CheckMessage::Finished(parse_php_diagnostics(&combined_output(&output), file_path))
+}
+
+/// `php -l` stops at the first error and reports it twice (once through the
+/// log, once on stdout): `Parse error: message in /path/file.php on line 3`.
+fn parse_php_diagnostics(output: &str, file_path: &Path) -> Vec<Diagnostic> {
+    let re = Regex::new(
+        r"(?m)^(?:PHP )?(?:Parse|Fatal) error:\s+(?P<msg>.*?) in (?P<file>.+?) on line (?P<line>\d+)\s*$",
+    )
+    .expect("static regex is valid");
+    for caps in re.captures_iter(output) {
+        if !matches_target_file(Path::new(&caps["file"]), file_path) {
+            continue;
+        }
+        return vec![Diagnostic {
+            line: caps["line"].parse::<usize>().unwrap_or(1).saturating_sub(1),
+            col: 0,
+            severity: Severity::Error,
+            code: String::new(),
+            message: caps["msg"].to_string(),
+        }];
+    }
+    Vec::new()
+}
+
+// ==================== TypeScript (tsc) ====================
+
+fn run_check_typescript(file_path: &Path, options: &CheckOptions) -> CheckMessage {
+    let tsc = options.tools.tsc.as_str();
+    let output = match run_tool(
+        tsc,
+        Command::new(tsc)
+            .args(["--noEmit", "--pretty", "false"])
+            .arg(absolute_path(file_path)),
+        options,
+    ) {
+        Ok(o) => o,
+        Err(msg) => return msg,
+    };
+    CheckMessage::Finished(parse_paren_diagnostics(
+        &combined_output(&output),
+        file_path,
+        false,
+    ))
+}
+
+// ==================== Kotlin (kotlinc), Swift (swiftc) ====================
+
+fn run_check_kotlin(file_path: &Path, options: &CheckOptions) -> CheckMessage {
+    let kotlinc = options.tools.kotlinc.as_str();
+    let absolute = absolute_path(file_path);
+    let dir = absolute.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let out_dir = stable_temp_dir(&absolute);
+    let output = match run_tool(
+        kotlinc,
+        in_english(Command::new(kotlinc).current_dir(&dir))
+            .arg("-d")
+            .arg(&out_dir)
+            .arg(&absolute),
+        options,
+    ) {
+        Ok(o) => o,
+        Err(msg) => return msg,
+    };
+    CheckMessage::Finished(parse_colon_diagnostics(
+        &combined_output(&output),
+        &dir,
+        file_path,
+    ))
+}
+
+fn run_check_swift(file_path: &Path, options: &CheckOptions) -> CheckMessage {
+    let swiftc = options.tools.swiftc.as_str();
+    let absolute = absolute_path(file_path);
+    let dir = absolute.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let output = match run_tool(
+        swiftc,
+        in_english(Command::new(swiftc).current_dir(&dir))
+            .arg("-typecheck")
+            .arg(&absolute),
+        options,
+    ) {
+        Ok(o) => o,
+        Err(msg) => return msg,
+    };
+    CheckMessage::Finished(parse_colon_diagnostics(
+        &combined_output(&output),
+        &dir,
+        file_path,
+    ))
 }
 
 // ==================== Rust (cargo check / rustc) ====================
@@ -1321,6 +1676,567 @@ mod tests {
                 args.starts_with("check ") && args.contains("Cargo.toml"),
                 "{args}"
             );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    // ---- C-family compilers and friends ----
+
+    fn files_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pc_cfam_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parses_gcc_and_clang_output() {
+        let dir = files_dir("gccparse");
+        let file = dir.join("a.c");
+        let other = dir.join("other.h");
+        std::fs::write(&file, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        let (f, o) = (file.display(), other.display());
+        let output = format!(
+            "{f}: In function 'main':\n\
+             {f}:3:5: warning: unused variable 'x' [-Wunused-variable]\n\
+             \x20   3 |     int x;\n\
+             \x20     |     ^\n\
+             {f}:3:5: note: declared here\n\
+             {f}:5:1: error: expected ';' before '}}' token\n\
+             {f}:2:10: fatal error: nope.h: No such file or directory\n\
+             {o}:1:1: error: belongs to another file\n\
+             {f}:1:1: warning: #pragma once in main file\n\
+             {f}:1:9: warning: '#pragma once' in main file [-Wpragma-once-outside-header]\n"
+        );
+        let diags = parse_colon_diagnostics(&output, &dir, &file);
+        assert_eq!(
+            diags.len(),
+            3,
+            "{:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        assert_eq!((diags[0].line, diags[0].col), (2, 4));
+        assert!(matches!(diags[0].severity, Severity::Warning));
+        assert_eq!(diags[0].code, "-Wunused-variable");
+        assert_eq!(diags[0].message, "unused variable 'x'");
+
+        assert_eq!((diags[1].line, diags[1].col), (4, 0));
+        assert!(matches!(diags[1].severity, Severity::Error));
+        assert_eq!(diags[1].message, "expected ';' before '}' token");
+
+        assert!(
+            matches!(diags[2].severity, Severity::Error),
+            "fatal error counts as an error"
+        );
+        assert_eq!(diags[2].message, "nope.h: No such file or directory");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_go_output_which_has_no_severity() {
+        let dir = files_dir("goparse");
+        let file = dir.join("main.go");
+        std::fs::write(&file, "").unwrap();
+        let output = "# command-line-arguments\n\
+                      ./main.go:5:2: declared and not used: y\n\
+                      vet: ./main.go:7:3: expected operand, found '}'\n\
+                      ./util.go:1:1: belongs to another file\n";
+        let diags = parse_colon_diagnostics(output, &dir, &file);
+        assert_eq!(diags.len(), 2);
+        assert_eq!((diags[0].line, diags[0].col), (4, 1));
+        assert!(matches!(diags[0].severity, Severity::Error));
+        assert_eq!(diags[0].message, "declared and not used: y");
+        assert_eq!(
+            diags[1].message, "expected operand, found '}'",
+            "the `vet:` prefix is dropped"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_relative_path_is_resolved_against_the_compilers_folder_not_ours() {
+        // Two different files named a.c: only the one in the compiler's
+        // folder is the target, whatever our own working directory holds.
+        let dir = files_dir("relpath");
+        let elsewhere = files_dir("relpath_other");
+        let target = dir.join("a.c");
+        std::fs::write(&target, "").unwrap();
+        std::fs::write(elsewhere.join("a.c"), "").unwrap();
+        let output = "a.c:1:1: error: in the target\n";
+        assert_eq!(parse_colon_diagnostics(output, &dir, &target).len(), 1);
+        assert!(parse_colon_diagnostics(output, &elsewhere, &target).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(elsewhere);
+    }
+
+    #[test]
+    fn parses_javac_output_and_finds_the_column_from_the_caret() {
+        let dir = files_dir("javacparse");
+        let file = dir.join("Main.java");
+        std::fs::write(&file, "").unwrap();
+        let output = "Main.java:3: error: ';' expected\n\
+                      \x20       int x = 1\n\
+                      \x20                ^\n\
+                      Main.java:7: warning: [deprecation] stop() in Thread has been deprecated\n\
+                      \x20       t.stop();\n\
+                      \x20        ^\n\
+                      Other.java:1: error: elsewhere\n\
+                      \x20^\n\
+                      2 errors\n";
+        let diags = parse_javac_diagnostics(output, &dir, &file);
+        assert_eq!(diags.len(), 2);
+        assert_eq!((diags[0].line, diags[0].col), (2, 17));
+        assert_eq!(diags[0].message, "';' expected");
+        assert!(matches!(diags[0].severity, Severity::Error));
+        assert_eq!((diags[1].line, diags[1].col), (6, 9));
+        assert_eq!(diags[1].code, "deprecation");
+        assert_eq!(diags[1].message, "stop() in Thread has been deprecated");
+        assert!(matches!(diags[1].severity, Severity::Warning));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_php_lint_output_reported_twice() {
+        let dir = files_dir("phpparse");
+        let file = dir.join("a.php");
+        std::fs::write(&file, "").unwrap();
+        let output = format!(
+            "PHP Parse error:  syntax error, unexpected token \";\" in {0} on line 3\n\
+             Parse error: syntax error, unexpected token \";\" in {0} on line 3\n\
+             Errors parsing {0}\n",
+            file.display()
+        );
+        let diags = parse_php_diagnostics(&output, &file);
+        assert_eq!(diags.len(), 1, "reported once");
+        assert_eq!(diags[0].line, 2);
+        assert_eq!(diags[0].message, "syntax error, unexpected token \";\"");
+        assert!(parse_php_diagnostics(
+            &format!("No syntax errors detected in {}\n", file.display()),
+            &file
+        )
+        .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_tsc_output_without_trimming_brackets_from_messages() {
+        let dir = files_dir("tscparse");
+        let file = dir.join("a.ts");
+        std::fs::write(&file, "").unwrap();
+        let output = format!(
+            "{0}(3,5): error TS1005: ';' expected.\n\
+             {0}(4,1): error TS2322: Type 'string' is not assignable to type 'number [] '.\n",
+            file.display()
+        );
+        let diags = parse_paren_diagnostics(&output, &file, false);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(
+            (diags[0].line, diags[0].col, diags[0].code.as_str()),
+            (2, 4, "TS1005")
+        );
+        assert!(diags[1].message.ends_with("'number [] '."));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn installed(tool: &str, flag: &str) -> bool {
+        Command::new(tool).arg(flag).output().is_ok()
+    }
+
+    /// Real compilers, when this machine has them.
+    #[cfg(unix)]
+    mod real_compilers {
+        use super::*;
+
+        fn write(dir: &Path, name: &str, source: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, source).unwrap();
+            path
+        }
+
+        fn options() -> CheckOptions {
+            CheckOptions {
+                timeout: Duration::from_secs(60),
+                ..CheckOptions::default()
+            }
+        }
+
+        #[test]
+        fn gcc_finds_errors_and_warnings_in_a_c_file() {
+            if !installed("gcc", "--version") {
+                eprintln!("skipped: no gcc");
+                return;
+            }
+            let dir = files_dir("realc");
+            let ok = write(
+                &dir,
+                "ok.c",
+                "#include <stdio.h>\nint main(void) { printf(\"hi\\n\"); return 0; }\n",
+            );
+            assert!(diagnostics_of(run_check_c_family(&ok, &options(), false)).is_empty());
+
+            let bad = write(
+                &dir,
+                "bad.c",
+                "int main(void) {\n    int x = 1\n    return 0;\n}\n",
+            );
+            let diags = diagnostics_of(run_check_c_family(&bad, &options(), false));
+            let error = diags
+                .iter()
+                .find(|d| matches!(d.severity, Severity::Error))
+                .expect("an error");
+            assert!(
+                error.line <= 2,
+                "points at the missing semicolon: line {}",
+                error.line + 1
+            );
+            assert!(error.message.contains("expected"), "{}", error.message);
+
+            let warn = write(
+                &dir,
+                "warn.c",
+                "int main(void) {\n    int unused;\n    return 0;\n}\n",
+            );
+            let diags = diagnostics_of(run_check_c_family(&warn, &options(), false));
+            assert_eq!(
+                diags.len(),
+                1,
+                "{:?}",
+                diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+            assert!(matches!(diags[0].severity, Severity::Warning));
+            assert_eq!(
+                (diags[0].line, diags[0].code.as_str()),
+                (1, "-Wunused-variable")
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn messages_stay_english_whatever_the_users_locale() {
+            if !installed("gcc", "--version") {
+                eprintln!("skipped: no gcc");
+                return;
+            }
+            let dir = files_dir("locale");
+            let bad = write(&dir, "bad.c", "int main(void) { return x; }\n");
+            // Even if the environment asks for another language.
+            std::env::set_var("LANGUAGE", "ru");
+            let diags = diagnostics_of(run_check_c_family(&bad, &options(), false));
+            assert_eq!(diags.len(), 1);
+            assert!(
+                diags[0].message.contains("undeclared"),
+                "{}",
+                diags[0].message
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn extra_flags_reach_the_compiler() {
+            if !installed("gcc", "--version") {
+                eprintln!("skipped: no gcc");
+                return;
+            }
+            let dir = files_dir("flags");
+            std::fs::create_dir_all(dir.join("inc")).unwrap();
+            write(&dir.join("inc"), "thing.h", "#define THING 1\n");
+            let src = write(
+                &dir,
+                "a.c",
+                "#include <thing.h>\nint f(void) { return THING; }\n",
+            );
+            // Without the include path the header is missing...
+            let diags = diagnostics_of(run_check_c_family(&src, &options(), false));
+            assert!(
+                diags.iter().any(|d| d.message.contains("thing.h")),
+                "{:?}",
+                diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+            // ...a relative -I is relative to the file's folder.
+            let mut with_flag = options();
+            with_flag.c_flags = vec!["-Iinc".to_string()];
+            assert!(diagnostics_of(run_check_c_family(&src, &with_flag, false)).is_empty());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn gpp_checks_cpp_and_pins_the_language_for_headers() {
+            if !installed("g++", "--version") {
+                eprintln!("skipped: no g++");
+                return;
+            }
+            let dir = files_dir("realcpp");
+            let bad = write(
+                &dir,
+                "bad.cpp",
+                "#include <vector>\nint main() { std::vector<int> v; v.push_back(\"s\"); }\n",
+            );
+            let diags = diagnostics_of(run_check_c_family(&bad, &options(), true));
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| matches!(d.severity, Severity::Error) && d.line == 1),
+                "{:?}",
+                diags
+                    .iter()
+                    .map(|d| (d.line, &d.message))
+                    .collect::<Vec<_>>()
+            );
+
+            // A .h that is really C++, and a header's #pragma once.
+            let header = write(
+                &dir,
+                "shape.h",
+                "#pragma once\nclass Shape { public: virtual ~Shape() {} };\n",
+            );
+            assert!(diagnostics_of(run_check_c_family(&header, &options(), true)).is_empty());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn go_vet_finds_syntax_and_type_errors() {
+            if !installed("go", "version") {
+                eprintln!("skipped: no go");
+                return;
+            }
+            let dir = files_dir("realgo");
+            let ok = write(&dir, "ok.go", "package main\n\nfunc main() {}\n");
+            assert!(diagnostics_of(run_check_go(&ok, &options())).is_empty());
+
+            let typed = write(
+                &dir,
+                "typed.go",
+                "package main\n\nfunc main() {\n\ty := 1\n}\n",
+            );
+            let diags = diagnostics_of(run_check_go(&typed, &options()));
+            assert_eq!(
+                diags.len(),
+                1,
+                "{:?}",
+                diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+            assert_eq!(diags[0].line, 3, "points at `y := 1`");
+            assert!(diags[0].message.contains("y"), "{}", diags[0].message);
+
+            let syntax = write(
+                &dir,
+                "syntax.go",
+                "package main\n\nfunc main() {\n\tx := \n}\n",
+            );
+            let diags = diagnostics_of(run_check_go(&syntax, &options()));
+            assert!(!diags.is_empty(), "a syntax error is reported");
+            assert!(matches!(diags[0].severity, Severity::Error));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn go_checks_the_whole_package_inside_a_module() {
+            if !installed("go", "version") {
+                eprintln!("skipped: no go");
+                return;
+            }
+            let dir = files_dir("gomod");
+            write(&dir, "go.mod", "module example.com/demo\n\ngo 1.21\n");
+            write(
+                &dir,
+                "helper.go",
+                "package main\n\nfunc helper() int { return 1 }\n",
+            );
+            // Uses helper() from the other file — only works if the package is checked as a whole.
+            let main = write(
+                &dir,
+                "main.go",
+                "package main\n\nfunc main() { _ = helper() }\n",
+            );
+            assert!(diagnostics_of(run_check_go(&main, &options())).is_empty());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Tools this machine may not have, stood in for by scripts that print
+    /// what the real ones print.
+    #[cfg(unix)]
+    mod stand_in_tools {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn script(dir: &Path, name: &str, body: &str) -> String {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_str().unwrap().to_string()
+        }
+
+        fn options() -> CheckOptions {
+            CheckOptions {
+                timeout: Duration::from_secs(20),
+                ..CheckOptions::default()
+            }
+        }
+
+        fn source(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            path
+        }
+
+        /// A stand-in that records its arguments and prints a canned
+        /// diagnostic naming its last argument.
+        fn recorder(dir: &Path, name: &str, printed: &str) -> (String, PathBuf) {
+            let log = dir.join(format!("{name}.args"));
+            let body = format!(
+                "echo \"$@\" > '{}'\nfor last; do :; done\nprintf '{}\\n' \"$last\"",
+                log.display(),
+                printed
+            );
+            (script(dir, name, &body), log)
+        }
+
+        #[test]
+        fn c_and_cpp_pass_the_language_the_flags_and_the_file() {
+            let dir = files_dir("fakecc");
+            let file = source(&dir, "a.h");
+            let (cc, log) = recorder(&dir, "fake-cc", "%s:3:5: error: boom");
+            let mut o = options();
+            o.tools.cc = cc;
+            o.c_flags = vec!["-Iinc".into(), "-std=c11".into()];
+            let diags = diagnostics_of(run_check_c_family(&file, &o, false));
+            assert_eq!((diags.len(), diags[0].line, diags[0].col), (1, 2, 4));
+            let args = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                args.contains("-fsyntax-only") && args.contains("-Wall"),
+                "{args}"
+            );
+            assert!(
+                args.contains("-Iinc -std=c11 -x c "),
+                "flags, then the language, then the file: {args}"
+            );
+
+            let (cxx, log) = recorder(&dir, "fake-cxx", "%s:4:1: warning: hmm [-Wfoo]");
+            let mut o = options();
+            o.tools.cxx = cxx;
+            o.cpp_flags = vec!["-std=c++20".into()];
+            let diags = diagnostics_of(run_check_c_family(&file, &o, true));
+            assert!(matches!(diags[0].severity, Severity::Warning));
+            assert_eq!(diags[0].code, "-Wfoo");
+            let args = std::fs::read_to_string(&log).unwrap();
+            assert!(args.contains("-std=c++20 -x c++ "), "{args}");
+            assert!(
+                !args.contains("-std=c11"),
+                "C flags don't leak into C++: {args}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn a_missing_c_compiler_is_reported_by_name() {
+            let dir = files_dir("nocc");
+            let file = source(&dir, "a.c");
+            let mut o = options();
+            o.tools.cc = "/no/such/cc".into();
+            match run_check_c_family(&file, &o, false) {
+                CheckMessage::ToolMissing(name) => assert_eq!(name, "/no/such/cc"),
+                _ => panic!("expected ToolMissing"),
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn javac_is_run_with_an_output_folder_and_the_caret_column_is_used() {
+            let dir = files_dir("fakejavac");
+            let file = source(&dir, "Main.java");
+            let log = dir.join("javac.args");
+            let mut o = options();
+            o.tools.javac = script(
+                &dir,
+                "fake-javac",
+                &format!(
+                    "echo \"$@\" > '{}'\nfor last; do :; done\nprintf 'Main.java:3: error: boom\\n  int x\\n     ^\\n1 error\\n' >&2",
+                    log.display()
+                ),
+            );
+            let diags = diagnostics_of(run_check_java(&file, &o));
+            assert_eq!(
+                (diags[0].line, diags[0].col, diags[0].message.as_str()),
+                (2, 5, "boom")
+            );
+            let args = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                args.starts_with("-d ") && args.trim_end().ends_with("Main.java"),
+                "{args}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn go_php_tsc_kotlinc_and_swiftc_use_their_configured_executables() {
+            let dir = files_dir("fakemisc");
+
+            let go_file = source(&dir, "main.go");
+            let (go, log) = recorder(&dir, "fake-go", "./main.go:3:7: undefined: nope");
+            let mut o = options();
+            o.tools.go = go;
+            let diags = diagnostics_of(run_check_go(&go_file, &o));
+            assert_eq!((diags[0].line, diags[0].col), (2, 6));
+            assert!(
+                std::fs::read_to_string(&log)
+                    .unwrap()
+                    .starts_with("vet main.go"),
+                "a loose file is vetted alone"
+            );
+
+            let php_file = source(&dir, "a.php");
+            let mut o = options();
+            o.tools.php = script(&dir, "fake-php", "printf 'PHP Parse error:  syntax error, unexpected end of file in %s on line 4\\n' \"$2\" >&2");
+            let diags = diagnostics_of(run_check_php(&php_file, &o));
+            assert_eq!(
+                (diags[0].line, diags[0].message.as_str()),
+                (3, "syntax error, unexpected end of file")
+            );
+
+            let ts_file = source(&dir, "a.ts");
+            let (tsc, log) = recorder(
+                &dir,
+                "fake-tsc",
+                "%s(2,9): error TS2304: Cannot find name 'nope'.",
+            );
+            let mut o = options();
+            o.tools.tsc = tsc;
+            let diags = diagnostics_of(run_check_typescript(&ts_file, &o));
+            assert_eq!(
+                (diags[0].line, diags[0].col, diags[0].code.as_str()),
+                (1, 8, "TS2304")
+            );
+            assert!(std::fs::read_to_string(&log)
+                .unwrap()
+                .starts_with("--noEmit --pretty false "));
+
+            let kt_file = source(&dir, "a.kt");
+            let (kotlinc, _) = recorder(
+                &dir,
+                "fake-kotlinc",
+                "%s:5:3: error: unresolved reference: nope",
+            );
+            let mut o = options();
+            o.tools.kotlinc = kotlinc;
+            let diags = diagnostics_of(run_check_kotlin(&kt_file, &o));
+            assert_eq!((diags[0].line, diags[0].col), (4, 2));
+
+            let swift_file = source(&dir, "a.swift");
+            let (swiftc, log) = recorder(
+                &dir,
+                "fake-swiftc",
+                "%s:1:1: error: cannot find 'nope' in scope",
+            );
+            let mut o = options();
+            o.tools.swiftc = swiftc;
+            let diags = diagnostics_of(run_check_swift(&swift_file, &o));
+            assert_eq!(diags.len(), 1);
+            assert!(std::fs::read_to_string(&log)
+                .unwrap()
+                .starts_with("-typecheck "));
             let _ = std::fs::remove_dir_all(dir);
         }
     }

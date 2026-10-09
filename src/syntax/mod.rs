@@ -89,6 +89,10 @@ impl Highlighter {
             // syntect's bundled grammars have no GDScript, so it ships its
             // own (gdscript.sublime-syntax) in a set of its own.
             Language::GdScript => Some(SyntectBackend::gdscript(theme)),
+            // Likewise for the C-family languages built from one template.
+            l if clike_spec(l).is_some() => {
+                clike_spec(l).map(|spec| SyntectBackend::clike(spec, theme))
+            }
             // `None` for the types left unstyled (see the struct docs).
             other => other
                 .bundled_syntax_extension()
@@ -139,6 +143,125 @@ impl Highlighter {
     }
 }
 
+/// What differs between the C-family languages that share the
+/// `clike.sublime-syntax` template: the file extension and the keyword
+/// groups, each a `|`-joined list of whole words.
+struct CLikeSpec {
+    name: &'static str,
+    extension: &'static str,
+    /// The keyword that introduces a function (`fun`, `func`, `function`),
+    /// if the language has one.
+    function_keyword: Option<&'static str>,
+    type_keywords: &'static str,
+    /// `var`, `let`, `val`, `import`, ...
+    storage: &'static str,
+    modifiers: &'static str,
+    control: &'static str,
+    operator_words: &'static str,
+    self_names: &'static str,
+    constants: &'static str,
+    /// Built-in types written in lowercase (the capitalized ones are
+    /// picked up as class names anyway).
+    builtin_types: &'static str,
+}
+
+const TYPESCRIPT: CLikeSpec = CLikeSpec {
+    name: "TypeScript",
+    extension: "ts",
+    function_keyword: Some("function"),
+    type_keywords: "class|interface|enum|type|namespace|module",
+    storage: "var|let|const|import|export|from|declare|default",
+    modifiers: "public|private|protected|static|readonly|abstract|async|override|get|set",
+    control: "if|else|for|while|do|switch|case|break|continue|return|try|catch|finally|throw|await|yield|with",
+    operator_words: "in|of|instanceof|typeof|keyof|is|as|new|delete|void|extends|implements|infer|satisfies",
+    self_names: "this|super",
+    constants: "true|false|null|undefined|NaN|Infinity",
+    builtin_types: "string|number|boolean|any|unknown|never|object|symbol|bigint",
+};
+
+const KOTLIN: CLikeSpec = CLikeSpec {
+    name: "Kotlin",
+    extension: "kt",
+    function_keyword: Some("fun"),
+    type_keywords: "class|interface|object|typealias",
+    storage: "val|var|import|package",
+    modifiers: "public|private|protected|internal|open|abstract|final|override|sealed|data|inner|enum|companion|inline|noinline|crossinline|reified|suspend|operator|infix|tailrec|lateinit|const|vararg|external|expect|actual|annotation|by|init|constructor|get|set",
+    control: "if|else|when|for|while|do|try|catch|finally|throw|return|break|continue",
+    operator_words: "in|is|as",
+    self_names: "this|super",
+    constants: "true|false|null",
+    builtin_types: "",
+};
+
+const SWIFT: CLikeSpec = CLikeSpec {
+    name: "Swift",
+    extension: "swift",
+    function_keyword: Some("func"),
+    type_keywords: "class|struct|enum|protocol|extension|actor|typealias|associatedtype",
+    storage: "let|var|import|init|deinit|subscript|operator|precedencegroup",
+    modifiers: "public|private|fileprivate|internal|open|final|static|override|mutating|nonmutating|lazy|weak|unowned|convenience|required|dynamic|inout|async|throws|rethrows|indirect|optional|some|any",
+    control: "if|else|guard|switch|case|default|for|while|repeat|do|try|catch|throw|return|break|continue|fallthrough|defer|where|await",
+    operator_words: "in|is|as",
+    self_names: "self|Self|super",
+    constants: "true|false|nil",
+    builtin_types: "",
+};
+
+const DART: CLikeSpec = CLikeSpec {
+    name: "Dart",
+    extension: "dart",
+    function_keyword: None,
+    type_keywords: "class|enum|mixin|extension|typedef",
+    storage: "var|final|const|late|import|export|library|part",
+    modifiers: "abstract|static|external|factory|covariant|required|async|sync|get|set|operator|implements|extends|with|on",
+    control: "if|else|for|while|do|switch|case|default|break|continue|return|try|catch|finally|throw|rethrow|await|yield|assert",
+    operator_words: "in|is|as|new",
+    self_names: "this|super",
+    constants: "true|false|null",
+    builtin_types: "int|double|num|bool|void|dynamic",
+};
+
+/// The table entry for a language that uses the template.
+fn clike_spec(language: Language) -> Option<&'static CLikeSpec> {
+    match language {
+        Language::TypeScript => Some(&TYPESCRIPT),
+        Language::Kotlin => Some(&KOTLIN),
+        Language::Swift => Some(&SWIFT),
+        Language::Dart => Some(&DART),
+        _ => None,
+    }
+}
+
+/// An alternation that can never match, for keyword groups a language
+/// doesn't have (an empty `(?:)` would match everywhere).
+const NEVER: &str = "(?!)";
+
+/// Fills in the template. The keyword lists are regex alternations as they
+/// stand; an empty one becomes a pattern that never matches.
+fn clike_grammar(spec: &CLikeSpec) -> String {
+    let words = |list: &str| {
+        if list.is_empty() {
+            NEVER.to_string()
+        } else {
+            list.to_string()
+        }
+    };
+    let scope = spec.name.to_lowercase();
+    include_str!("clike.sublime-syntax")
+        .replace("@@NAME@@", spec.name)
+        .replace("@@EXT@@", spec.extension)
+        .replace("@@SCOPE@@", &scope)
+        .replace("@@FUNC_KW@@", spec.function_keyword.unwrap_or(NEVER))
+        .replace("@@CLASS_KW@@", &words(spec.type_keywords))
+        .replace("@@STORAGE@@", &words(spec.storage))
+        .replace("@@MODIFIERS@@", &words(spec.modifiers))
+        .replace("@@CONTROL@@", &words(spec.control))
+        .replace("@@OPERATOR_WORDS@@", &words(spec.operator_words))
+        .replace("@@SELF@@", &words(spec.self_names))
+        .replace("@@CONSTANTS@@", &words(spec.constants))
+        .replace("@@BUILTIN_TYPES@@", &words(spec.builtin_types))
+}
+
 impl SyntectBackend {
     fn bundled(extension: &str, theme: Theme) -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -146,6 +269,23 @@ impl SyntectBackend {
             .find_syntax_by_extension(extension)
             .cloned()
             .unwrap_or_else(|| syntax_set.find_syntax_plain_text().clone());
+        Self {
+            syntax_set,
+            theme,
+            syntax,
+        }
+    }
+
+    fn clike(spec: &CLikeSpec, theme: Theme) -> Self {
+        let definition = SyntaxDefinition::load_from_str(&clike_grammar(spec), true, None)
+            .unwrap_or_else(|e| panic!("bundled {} grammar is valid: {e}", spec.name));
+        let mut builder = SyntaxSetBuilder::new();
+        builder.add(definition);
+        let syntax_set = builder.build();
+        let syntax = syntax_set
+            .find_syntax_by_extension(spec.extension)
+            .cloned()
+            .expect("the grammar registers its own extension");
         Self {
             syntax_set,
             theme,
@@ -216,7 +356,7 @@ mod tests {
             "notes.txt",
             "data.csv",
             "config.toml",
-            "main.go",
+            "main.zig",
             "Makefile",
         ] {
             let rows = spans_for(path, "hello world 123 \"quoted\"");
@@ -459,5 +599,243 @@ func _ready() -> void:
         let (h, _) = Highlighter::new(Language::Rust, true, DEFAULT_THEME);
         let rows = h.highlight(&["fn main() {}".to_string()], 1);
         assert!(rows[0].iter().any(|(s, _)| s.fg.is_some()));
+    }
+
+    #[test]
+    fn every_language_with_a_bundled_grammar_really_has_one() {
+        let set = SyntaxSet::load_defaults_newlines();
+        let plain = set.find_syntax_plain_text().name.clone();
+        for &language in crate::language::ALL {
+            if let Some(extension) = language.bundled_syntax_extension() {
+                let syntax = set
+                    .find_syntax_by_extension(extension)
+                    .unwrap_or_else(|| panic!("no bundled grammar for .{extension}"));
+                assert_ne!(
+                    syntax.name,
+                    plain,
+                    "{} fell back to plain text",
+                    language.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn c_family_languages_are_colored() {
+        for (path, source) in [
+            ("a.c", "#include <stdio.h>\nint main(void) { return 0; }"),
+            ("a.h", "typedef struct { int x; } P;"),
+            ("a.cpp", "#include <vector>\nstd::vector<int> v = {1, 2};"),
+            ("A.java", "public class A { int x = 1; }"),
+            ("main.go", "package main\nfunc main() { x := 1 }"),
+            ("a.php", "<?php function f() { return 1; }"),
+            ("A.scala", "object A { val x = 1 }"),
+            ("a.m", "@interface A : NSObject\n@end"),
+        ] {
+            let rows = spans_for(path, source);
+            assert!(
+                rows.iter().any(|r| distinct_colors(r) >= 2),
+                "{path} looks unstyled: {rows:?}"
+            );
+        }
+    }
+
+    /// One snippet per template language that uses every kind of token the
+    /// template knows.
+    fn template_samples() -> Vec<(&'static str, String)> {
+        let ts = [
+            "import { A } from \"./a\";",
+            "@Component({})",
+            "export class Foo extends Bar implements Baz {",
+            "  private readonly x: number = 0x1F + 1_000 + 1.5e3;",
+            "  async run(name: string): Promise<void> {",
+            "    const s = `hi ${name} \\n` + 'single' + \"double\";",
+            "    if (this.x > 0 && name !== undefined) { return; } // note",
+            "    /* block",
+            "       comment */",
+            "  }",
+            "}",
+            "function helper(a: any) { return a ?? null; }",
+            "interface Shape { area(): number }",
+        ];
+        let kt = [
+            "package demo",
+            "import kotlin.math.*",
+            "@JvmStatic",
+            "data class User(val name: String, var age: Int = 0x10)",
+            "fun greet(u: User?): String {",
+            "    val s = \"Hello ${u?.name} $x\" + 'c' + \"\"\"raw",
+            "text\"\"\"",
+            "    when (u) { is User -> println(s) else -> return \"none\" }",
+            "    for (i in 1..10) { if (i % 2 == 0) continue } // even",
+            "    return s /* done */",
+            "}",
+        ];
+        let swift = [
+            "import Foundation",
+            "@available(iOS 13, *)",
+            "public struct Point: Equatable {",
+            "    var x: Double = 1.5e3",
+            "    private(set) var y = 0b101",
+            "    mutating func move(by d: Int) -> Self {",
+            "        guard let v = Optional(d) else { return self }",
+            "        let s = \"moved \\(v) times\" + \"\"\"",
+            "multi",
+            "\"\"\"",
+            "        switch v { case 1: break; default: fallthrough }",
+            "        return self // done",
+            "    }",
+            "}",
+            "enum Dir { case north, south }",
+        ];
+        let dart = [
+            "import 'package:flutter/material.dart';",
+            "@override",
+            "class Foo extends StatelessWidget with Bar {",
+            "  final int count = 0xFF;",
+            "  static const double pi = 3.14e0;",
+            "  Future<void> run(String name) async {",
+            "    var s = 'hi $name ${name.length}' + \"x\" + '''multi",
+            "line''';",
+            "    if (name is String && count > 0) { await Future.delayed(d); } // c",
+            "    /* block */ return;",
+            "  }",
+            "}",
+        ];
+        vec![
+            ("a.ts", ts.join("\n")),
+            ("a.kt", kt.join("\n")),
+            ("a.swift", swift.join("\n")),
+            ("a.dart", dart.join("\n")),
+        ]
+    }
+
+    #[test]
+    fn template_grammars_load_and_every_context_compiles() {
+        for (path, source) in template_samples() {
+            let rows = spans_for(path, &source);
+            assert!(rows.len() > 8, "{path}");
+            assert!(
+                rows.iter().any(|r| distinct_colors(r) >= 3),
+                "{path} has no richly colored line: {rows:?}"
+            );
+        }
+    }
+
+    type Check = (usize, &'static str, &'static str);
+
+    #[test]
+    fn template_grammars_color_each_kind_of_token_differently() {
+        // Each listed token must differ in color from a plain identifier.
+        let cases: Vec<(&str, &str, &str, Vec<Check>)> = vec![
+            (
+                "a.kt",
+                "val x = foo(\"s\", 10) // c\nreturn null",
+                "x",
+                vec![
+                    (0, "val", "storage keyword"),
+                    (0, "foo", "call"),
+                    (0, "10", "number"),
+                    (1, "return", "control"),
+                    (1, "null", "constant"),
+                ],
+            ),
+            (
+                "a.swift",
+                "let x = foo(1) // c\nguard true else { return }",
+                "x",
+                vec![
+                    (0, "let", "storage keyword"),
+                    (0, "foo", "call"),
+                    (0, "1", "number"),
+                    (1, "guard", "control"),
+                    (1, "true", "constant"),
+                ],
+            ),
+            (
+                "a.dart",
+                "final x = foo(1); // c\nreturn null;",
+                "x",
+                vec![
+                    (0, "final", "storage keyword"),
+                    (0, "foo", "call"),
+                    (0, "1", "number"),
+                    (1, "return", "control"),
+                    (1, "null", "constant"),
+                ],
+            ),
+            (
+                "a.ts",
+                "function foo(a: number) { return undefined } // c",
+                "", // the plain text between tokens
+                vec![
+                    (0, "function", "function keyword"),
+                    (0, "foo", "function name"),
+                    (0, "number", "builtin type"),
+                    (0, "return", "control"),
+                    (0, "undefined", "constant"),
+                ],
+            ),
+        ];
+        for (path, source, plain_text, checks) in cases {
+            let rows = spans_for(path, source);
+            let plain = fg_of(&rows[0], plain_text)
+                .unwrap_or_else(|| panic!("{path}: no span for {plain_text:?}: {:?}", rows[0]));
+            for (row, text, what) in checks {
+                let c = fg_of(&rows[row], text).unwrap_or_else(|| {
+                    panic!("{path}: no span for {what} {text:?} in {:?}", rows[row])
+                });
+                assert_ne!(
+                    c, plain,
+                    "{path}: {what} ({text:?}) should not look like a plain identifier"
+                );
+            }
+            assert!(
+                rows[0]
+                    .iter()
+                    .any(|(s, t)| t.contains("// c") && s.fg.is_some() && s.fg != Some(plain)),
+                "{path}: comment not colored: {:?}",
+                rows[0]
+            );
+        }
+    }
+
+    #[test]
+    fn template_strings_hide_comments_and_comments_hide_keywords() {
+        for path in ["a.ts", "a.kt", "a.swift", "a.dart"] {
+            let rows = spans_for(path, "// if else return\nlet s = \"// not a comment\"");
+            assert_eq!(
+                rows[0].len(),
+                1,
+                "{path}: one comment span, got {:?}",
+                rows[0]
+            );
+            let comment = rows[0][0].0.fg;
+            let inside = rows[1]
+                .iter()
+                .find(|(_, t)| t.contains("not a comment"))
+                .expect("string span");
+            assert_ne!(inside.0.fg, comment, "{path}");
+        }
+    }
+
+    #[test]
+    fn template_unterminated_string_does_not_swallow_following_lines() {
+        for (path, line2, keyword) in [
+            ("a.kt", "fun f() {}", "fun"),
+            ("a.swift", "func f() {}", "func"),
+            ("a.ts", "function f() {}", "function"),
+        ] {
+            let rows = spans_for(path, &format!("var s = \"oops\n{line2}"));
+            let plain = highlighter_for(path).highlight(&["x".to_string()], 1)[0][0]
+                .0
+                .fg;
+            let kw = fg_of(&rows[1], keyword).unwrap_or_else(|| panic!("{path}: {:?}", rows[1]));
+            assert_ne!(
+                Some(kw),
+                plain,
+                "{path}: `{keyword}` should still be a keyword"
+            );
+        }
     }
 }

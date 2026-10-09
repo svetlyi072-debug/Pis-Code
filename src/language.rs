@@ -22,6 +22,17 @@ pub enum BraceSplit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     CSharp,
+    C,
+    Cpp,
+    ObjectiveC,
+    Java,
+    Go,
+    Php,
+    TypeScript,
+    Kotlin,
+    Swift,
+    Dart,
+    Scala,
     JavaScript,
     Rust,
     Python,
@@ -38,6 +49,17 @@ pub enum Language {
 /// Every language, in the order they're documented.
 pub const ALL: &[Language] = &[
     Language::CSharp,
+    Language::C,
+    Language::Cpp,
+    Language::ObjectiveC,
+    Language::Java,
+    Language::Go,
+    Language::Php,
+    Language::TypeScript,
+    Language::Kotlin,
+    Language::Swift,
+    Language::Dart,
+    Language::Scala,
     Language::JavaScript,
     Language::Rust,
     Language::Python,
@@ -57,6 +79,17 @@ impl Language {
     pub fn id(self) -> &'static str {
         match self {
             Language::CSharp => "csharp",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::ObjectiveC => "objc",
+            Language::Java => "java",
+            Language::Go => "go",
+            Language::Php => "php",
+            Language::TypeScript => "typescript",
+            Language::Kotlin => "kotlin",
+            Language::Swift => "swift",
+            Language::Dart => "dart",
+            Language::Scala => "scala",
             Language::JavaScript => "javascript",
             Language::Rust => "rust",
             Language::Python => "python",
@@ -110,6 +143,21 @@ impl Language {
             .map(str::to_ascii_lowercase);
         match ext.as_deref() {
             Some("cs") => Language::CSharp,
+            // `.h` is ambiguous (C or C++); C is the safer guess, and
+            // `[associations]` can say otherwise per project.
+            Some("c" | "h") => Language::C,
+            Some(
+                "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ipp" | "tpp" | "inl",
+            ) => Language::Cpp,
+            Some("m" | "mm") => Language::ObjectiveC,
+            Some("java") => Language::Java,
+            Some("go") => Language::Go,
+            Some("php" | "phtml" | "php5" | "php7" | "phps") => Language::Php,
+            Some("ts" | "tsx" | "mts" | "cts") => Language::TypeScript,
+            Some("kt" | "kts") => Language::Kotlin,
+            Some("swift") => Language::Swift,
+            Some("dart") => Language::Dart,
+            Some("scala" | "sc" | "sbt") => Language::Scala,
             Some("js" | "mjs" | "cjs" | "jsx") => Language::JavaScript,
             Some("rs") => Language::Rust,
             Some("py" | "py3" | "pyw" | "pyi") => Language::Python,
@@ -135,6 +183,13 @@ impl Language {
     pub fn bundled_syntax_extension(self) -> Option<&'static str> {
         match self {
             Language::CSharp => Some("cs"),
+            Language::C => Some("c"),
+            Language::Cpp => Some("cpp"),
+            Language::ObjectiveC => Some("m"),
+            Language::Java => Some("java"),
+            Language::Go => Some("go"),
+            Language::Php => Some("php"),
+            Language::Scala => Some("scala"),
             Language::JavaScript => Some("js"),
             Language::Rust => Some("rs"),
             Language::Python => Some("py"),
@@ -144,21 +199,47 @@ impl Language {
             Language::Xml => Some("xml"),
             Language::Yaml => Some("yaml"),
             Language::Markdown => Some("md"),
-            Language::GdScript | Language::Other => None,
+            // Written for the editor (see `syntax/`): syntect's bundled set
+            // has no grammar for these.
+            Language::GdScript
+            | Language::TypeScript
+            | Language::Kotlin
+            | Language::Swift
+            | Language::Dart
+            | Language::Other => None,
         }
     }
 
-    /// `{}` is a block in C#, JavaScript, Rust and CSS, so Enter between an
-    /// autoclosed pair splits it Allman-style; in JSON it's a data literal
-    /// that is conventionally written K&R-style. Elsewhere there's no split.
+    /// `{}` is a block in every C-family language, so Enter between an
+    /// autoclosed pair splits it Allman-style. Go is the exception: its
+    /// grammar forbids a brace on its own line (a newline there inserts a
+    /// semicolon), so it gets the K&R shape, as does JSON, where `{}` is a
+    /// data literal. Elsewhere there's no split.
     pub fn brace_split(self) -> BraceSplit {
         match self {
-            Language::CSharp | Language::JavaScript | Language::Rust | Language::Css => {
-                BraceSplit::Allman
-            }
-            Language::Json => BraceSplit::KAndR,
+            Language::CSharp
+            | Language::C
+            | Language::Cpp
+            | Language::ObjectiveC
+            | Language::Java
+            | Language::Php
+            | Language::TypeScript
+            | Language::Kotlin
+            | Language::Swift
+            | Language::Dart
+            | Language::Scala
+            | Language::JavaScript
+            | Language::Rust
+            | Language::Css => BraceSplit::Allman,
+            Language::Go | Language::Json => BraceSplit::KAndR,
             _ => BraceSplit::None,
         }
+    }
+
+    /// Whether Enter between `[` and `]` splits them onto three lines (when
+    /// the brace style is K&R): right for JSON arrays, wrong for `[]int`.
+    pub fn splits_square_brackets(self) -> bool {
+        self == Language::Json
     }
 
     /// Indentation-based blocks: a trailing `:` opens one.
@@ -166,10 +247,11 @@ impl Language {
         matches!(self, Language::Python | Language::GdScript | Language::Yaml)
     }
 
-    /// `'` is a lifetime marker in Rust and an apostrophe in prose, so
-    /// autoclosing it into `''` there is more nuisance than help.
+    /// `'` is a lifetime marker in Rust and an apostrophe in prose, and
+    /// Swift has no single-quoted literals at all, so autoclosing it into
+    /// `''` there is more nuisance than help.
     pub fn autocloses_single_quote(self) -> bool {
-        !matches!(self, Language::Rust | Language::Markdown)
+        !matches!(self, Language::Rust | Language::Markdown | Language::Swift)
     }
 
     /// Whether files of this type are made of tags (HTML, XML) — what tag
@@ -184,12 +266,13 @@ impl Language {
 
     /// Indent unit for a file that doesn't show one yet. GDScript's style
     /// guide (and Godot's editor) uses tabs, and mixing tabs with spaces is
-    /// a parse error there. YAML conventionally uses two spaces (and
-    /// forbids tabs outright).
+    /// a parse error there; Go's formatter insists on tabs. YAML
+    /// conventionally uses two spaces (and forbids tabs outright), and so
+    /// does Dart's formatter.
     pub fn default_indent(self) -> &'static str {
         match self {
-            Language::GdScript => "\t",
-            Language::Yaml => "  ",
+            Language::GdScript | Language::Go => "\t",
+            Language::Yaml | Language::Dart => "  ",
             _ => "    ",
         }
     }
@@ -201,7 +284,16 @@ impl Language {
 
     /// Whether Ctrl+Shift+S has a checker to run for this file type.
     pub fn has_checker(self) -> bool {
-        !matches!(self, Language::Css | Language::Markdown | Language::Other)
+        !matches!(
+            self,
+            Language::Css
+                | Language::Markdown
+                | Language::Other
+                // No dependable command-line syntax check for these.
+                | Language::ObjectiveC
+                | Language::Dart
+                | Language::Scala
+        )
     }
 }
 
@@ -225,6 +317,76 @@ mod tests {
         assert!(lang("a.gd") == Language::GdScript);
         assert!(lang("a.txt") == Language::Other);
         assert!(lang("Makefile") == Language::Other);
+    }
+
+    #[test]
+    fn c_family_extensions() {
+        for (path, want) in [
+            ("a.c", Language::C),
+            ("a.h", Language::C),
+            ("a.cpp", Language::Cpp),
+            ("a.CC", Language::Cpp),
+            ("a.cxx", Language::Cpp),
+            ("a.hpp", Language::Cpp),
+            ("a.m", Language::ObjectiveC),
+            ("a.mm", Language::ObjectiveC),
+            ("A.java", Language::Java),
+            ("main.go", Language::Go),
+            ("index.php", Language::Php),
+            ("a.ts", Language::TypeScript),
+            ("a.tsx", Language::TypeScript),
+            ("a.kt", Language::Kotlin),
+            ("build.gradle.kts", Language::Kotlin),
+            ("a.swift", Language::Swift),
+            ("main.dart", Language::Dart),
+            ("A.scala", Language::Scala),
+            ("a.js", Language::JavaScript),
+        ] {
+            assert!(lang(path) == want, "{path}");
+        }
+    }
+
+    #[test]
+    fn every_block_language_splits_braces_allman_except_go() {
+        for l in [
+            Language::C,
+            Language::Cpp,
+            Language::ObjectiveC,
+            Language::Java,
+            Language::Php,
+            Language::TypeScript,
+            Language::Kotlin,
+            Language::Swift,
+            Language::Dart,
+            Language::Scala,
+        ] {
+            assert!(l.brace_split() == BraceSplit::Allman, "{}", l.id());
+        }
+        // A brace on its own line is a syntax error in Go.
+        assert!(Language::Go.brace_split() == BraceSplit::KAndR);
+        assert!(
+            !Language::Go.splits_square_brackets(),
+            "[]int is not an array literal"
+        );
+        assert!(Language::Json.splits_square_brackets());
+    }
+
+    #[test]
+    fn indent_and_quote_conventions_of_the_newer_languages() {
+        assert_eq!(Language::Go.default_indent(), "\t");
+        assert_eq!(Language::Dart.default_indent(), "  ");
+        assert_eq!(Language::Java.default_indent(), "    ");
+        assert!(Language::C.autocloses_single_quote(), "char literals");
+        assert!(!Language::Swift.autocloses_single_quote());
+    }
+
+    #[test]
+    fn ids_are_unique() {
+        let mut ids: Vec<_> = ALL.iter().map(|l| l.id()).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len());
     }
 
     #[test]

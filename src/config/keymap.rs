@@ -36,6 +36,13 @@ pub enum Action {
     PageDown,
     WordLeft,
     WordRight,
+    Find,
+    FindNext,
+    FindPrevious,
+    /// These three act inside the find bar only.
+    FindToggleCase,
+    FindToggleWholeWord,
+    FindToggleRegex,
 }
 
 impl Action {
@@ -70,11 +77,29 @@ const MOD_MASK: KeyModifiers = KeyModifiers::CONTROL
     .union(KeyModifiers::SHIFT)
     .union(KeyModifiers::SUPER);
 
+/// The Russian (ЙЦУКЕН) layout, key for key, against the US QWERTY keys that
+/// sit in the same physical places. A shortcut is a *position* on the
+/// keyboard, so Ctrl+Ы has to act as Ctrl+S.
+const RUSSIAN_LAYOUT: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+const US_LAYOUT: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+
+/// The US-layout key at the same position as `c` on the Russian layout;
+/// any other character is returned as it is. Expects lowercase.
+fn same_key_on_us_layout(c: char) -> char {
+    RUSSIAN_LAYOUT
+        .chars()
+        .position(|r| r == c)
+        .and_then(|i| US_LAYOUT.chars().nth(i))
+        .unwrap_or(c)
+}
+
 impl Chord {
     /// Canonicalizes a terminal key event: letters under Ctrl/Alt are
     /// lowercased with the case folded into an explicit Shift (terminals
-    /// report Ctrl+Shift+S as either `S`+Ctrl or `s`+Ctrl+Shift), and
-    /// Shift+Tab (`BackTab`) drops its redundant Shift.
+    /// report Ctrl+Shift+S as either `S`+Ctrl or `s`+Ctrl+Shift), Russian
+    /// letters under Ctrl/Alt become the US-layout key in the same place,
+    /// and Shift+Tab (`BackTab`) drops its redundant Shift. Plain typing is
+    /// never translated: a Cyrillic letter without Ctrl/Alt stays itself.
     pub fn from_event(key: &KeyEvent) -> Chord {
         let mut mods = key.modifiers & MOD_MASK;
         let code = match key.code {
@@ -85,7 +110,8 @@ impl Chord {
                 if c.is_uppercase() {
                     mods |= KeyModifiers::SHIFT;
                 }
-                KeyCode::Char(c.to_lowercase().next().unwrap_or(c))
+                let lower = c.to_lowercase().next().unwrap_or(c);
+                KeyCode::Char(same_key_on_us_layout(lower))
             }
             KeyCode::BackTab => {
                 mods -= KeyModifiers::SHIFT;
@@ -157,7 +183,9 @@ impl Chord {
                     _ => return Err(format!("no such function key '{f}'")),
                 }
             }
-            c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap()),
+            c if c.chars().count() == 1 => {
+                KeyCode::Char(same_key_on_us_layout(c.chars().next().unwrap()))
+            }
             other => return Err(format!("unknown key '{other}'")),
         };
 
@@ -286,6 +314,7 @@ impl Keymap {
             (Action::Copy, "copy"),
             (Action::Cut, "cut"),
             (Action::Paste, "paste"),
+            (Action::Find, "find"),
         ];
         SHOWN
             .iter()
@@ -356,6 +385,95 @@ mod tests {
             assert!(Chord::parse(bad).is_err(), "{bad:?}");
         }
         assert!(Chord::parse("hyper+s").unwrap_err().contains("hyper"));
+    }
+
+    #[test]
+    fn russian_layout_shortcuts_are_the_same_keys_as_on_the_us_layout() {
+        let ctrl = |c| Chord::from_event(&event(KeyCode::Char(c), KeyModifiers::CONTROL));
+        // Every letter of the layout lands on its US twin.
+        assert_eq!(RUSSIAN_LAYOUT.chars().count(), US_LAYOUT.chars().count());
+        for (ru, us) in RUSSIAN_LAYOUT.chars().zip(US_LAYOUT.chars()) {
+            assert_eq!(ctrl(ru), ctrl(us), "Ctrl+{ru} should be Ctrl+{us}");
+        }
+        // Spot checks against the default bindings, written out by hand.
+        let km = Keymap::from_config(&KeysConfig::default()).0;
+        let action = |c, mods| km.resolve(&event(KeyCode::Char(c), mods)).map(|(a, _)| a);
+        let c = KeyModifiers::CONTROL;
+        assert_eq!(action('ы', c), Some(Action::Save)); // S
+        assert_eq!(action('й', c), Some(Action::Quit)); // Q
+        assert_eq!(action('я', c), Some(Action::Undo)); // Z
+        assert_eq!(action('н', c), Some(Action::Redo)); // Y
+        assert_eq!(action('ф', c), Some(Action::SelectAll)); // A
+        assert_eq!(action('с', c), Some(Action::Copy)); // C
+        assert_eq!(action('ч', c), Some(Action::Cut)); // X
+        assert_eq!(action('м', c), Some(Action::Paste)); // V
+        assert_eq!(action('ц', c), Some(Action::DeleteWordBackward)); // W
+        assert_eq!(action('р', c), Some(Action::DeleteWordBackward)); // H
+    }
+
+    #[test]
+    fn russian_ctrl_shift_letters_arrive_in_every_shape_terminals_use() {
+        let want = chord("ctrl+shift+s");
+        for (c, mods) in [
+            ('Ы', KeyModifiers::CONTROL),
+            ('ы', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            ('Ы', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(
+                Chord::from_event(&event(KeyCode::Char(c), mods)),
+                want,
+                "{c} {mods:?}"
+            );
+        }
+        let km = Keymap::from_config(&KeysConfig::default()).0;
+        let key = event(
+            KeyCode::Char('ы'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(km.resolve(&key), Some((Action::SaveAndCheck, false)));
+    }
+
+    #[test]
+    fn alt_shortcuts_follow_the_layout_too_but_plain_typing_does_not() {
+        assert_eq!(
+            Chord::from_event(&event(KeyCode::Char('ы'), KeyModifiers::ALT)),
+            chord("alt+s")
+        );
+        let km = Keymap::from_config(&KeysConfig::default()).0;
+        for typed in ['ы', 'Ы', 'й', 'ё'] {
+            assert_eq!(
+                km.resolve(&event(KeyCode::Char(typed), KeyModifiers::NONE)),
+                None,
+                "{typed} typed without Ctrl/Alt is text, not a shortcut"
+            );
+        }
+        let mut shifted = event(KeyCode::Char('Ы'), KeyModifiers::SHIFT);
+        assert_eq!(km.resolve(&shifted), None);
+        shifted.modifiers = KeyModifiers::NONE;
+        assert_eq!(
+            Chord::from_event(&shifted).code,
+            KeyCode::Char('Ы'),
+            "case is kept"
+        );
+    }
+
+    #[test]
+    fn a_binding_written_with_a_russian_letter_means_that_key() {
+        assert_eq!(chord("ctrl+ы"), chord("ctrl+s"));
+        assert_eq!(chord("Ctrl+Shift+Ы"), chord("ctrl+shift+s"));
+        let keys = KeysConfig {
+            save: vec!["ctrl+ы".into()],
+            ..KeysConfig::default()
+        };
+        let (km, warnings) = Keymap::from_config(&keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            km.hint().split("  ").next(),
+            Some("^S save"),
+            "the hint stays in Latin"
+        );
+        let key = event(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(km.resolve(&key), Some((Action::Save, false)));
     }
 
     #[test]
@@ -505,7 +623,7 @@ mod tests {
         let (km, _) = Keymap::from_config(&KeysConfig::default());
         assert_eq!(
             km.hint(),
-            "^S save  ^⇧S save+check  ^Q quit  ^Z undo  ^Y redo  ^A select all  ^C copy  ^X cut  ^V paste"
+            "^S save  ^⇧S save+check  ^Q quit  ^Z undo  ^Y redo  ^A select all  ^C copy  ^X cut  ^V paste  ^F find"
         );
         let remapped = KeysConfig {
             save: vec!["f2".into()],

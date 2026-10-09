@@ -3,10 +3,24 @@
 //! styling in [`UiSettings`].
 
 use super::{
-    BraceStyle, Config, CursorStyle, IndentStyle, LanguageOverride, LineEnding, StatusPosition,
+    BraceStyle, CaseMode, Config, CursorStyle, IndentStyle, LanguageOverride, LineEnding,
+    StatusPosition,
 };
 use crate::language::{BraceSplit, Language};
 use ratatui::style::{Color, Modifier, Style};
+
+/// How the find bar (Ctrl+F) behaves; the same for every language.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchSettings {
+    pub case: CaseMode,
+    /// Whether the bar starts in regular-expression mode / whole-word mode.
+    pub regex: bool,
+    pub whole_word: bool,
+    pub wrap_around: bool,
+    pub incremental: bool,
+    pub select_on_close: bool,
+    pub highlight_matches: bool,
+}
 
 /// Editing behavior for one file, with every layer already applied. For
 /// each option the most specific layer wins:
@@ -37,6 +51,7 @@ pub struct Settings {
     pub trim_trailing_whitespace: bool,
     pub highlight: bool,
     pub check: bool,
+    pub search: SearchSettings,
 }
 
 impl Settings {
@@ -86,6 +101,15 @@ impl Settings {
                 .unwrap_or(f.trim_trailing_whitespace),
             highlight: o.highlight.unwrap_or(true) && config.syntax.enabled,
             check: o.check.unwrap_or(true) && config.check.enabled && language.has_checker(),
+            search: SearchSettings {
+                case: config.search.case,
+                regex: config.search.regex,
+                whole_word: config.search.whole_word,
+                wrap_around: config.search.wrap_around,
+                incremental: config.search.incremental,
+                select_on_close: config.search.select_on_close,
+                highlight_matches: config.search.highlight_matches,
+            },
         }
     }
 }
@@ -146,6 +170,9 @@ pub struct UiSettings {
     pub status_error_fg: Color,
     pub status_error_bg: Color,
     pub selection: SelectionStyle,
+    pub search_match: Color,
+    pub search_current: Color,
+    pub search_current_text: Color,
 
     pub mark_gutter: bool,
     pub underline_diagnostics: bool,
@@ -211,6 +238,18 @@ impl UiSettings {
             &defaults.status_error_bg,
         );
 
+        let search_match = color("search_match", &c.search_match, &defaults.search_match);
+        let search_current = color(
+            "search_current",
+            &c.search_current,
+            &defaults.search_current,
+        );
+        let search_current_text = color(
+            "search_current_text",
+            &c.search_current_text,
+            &defaults.search_current_text,
+        );
+
         let selection = match c.selection.trim().to_lowercase().as_str() {
             "reverse" => SelectionStyle::Reverse,
             "underline" => SelectionStyle::Underline,
@@ -258,6 +297,9 @@ impl UiSettings {
                 status_error_fg,
                 status_error_bg,
                 selection,
+                search_match,
+                search_current,
+                search_current_text,
                 mark_gutter: config.check.mark_gutter,
                 underline_diagnostics: config.check.underline,
             },
@@ -391,6 +433,30 @@ mod tests {
         assert!(!Settings::resolve(&c, Language::Python).highlight);
         assert!(!Settings::resolve(&c, Language::Python).check);
         assert!(Settings::resolve(&c, Language::Rust).highlight);
+    }
+
+    #[test]
+    fn search_settings_and_colors_come_from_the_config() {
+        let mut c = Config::default();
+        c.search.case = CaseMode::Sensitive;
+        c.search.wrap_around = false;
+        c.search.regex = true;
+        c.colors.search_match = "#112233".into();
+        c.colors.search_current = "red".into();
+        c.colors.search_current_text = "bad-color".into();
+        let s = Settings::resolve(&c, Language::Rust);
+        assert_eq!(s.search.case, CaseMode::Sensitive);
+        assert!(!s.search.wrap_around && s.search.regex && s.search.incremental);
+        let (ui, warnings) = UiSettings::from_config(&c);
+        assert_eq!(ui.search_match, Color::Rgb(0x11, 0x22, 0x33));
+        assert_eq!(ui.search_current, Color::Red);
+        assert_eq!(
+            ui.search_current_text,
+            Color::Black,
+            "fell back to the default"
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("colors.search_current_text"));
     }
 
     #[test]

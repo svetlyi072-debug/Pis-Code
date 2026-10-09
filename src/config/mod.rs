@@ -11,7 +11,7 @@ mod keymap;
 mod settings;
 
 pub use keymap::{Action, Keymap};
-pub use settings::{HintSetting, SelectionStyle, Settings, UiSettings};
+pub use settings::{HintSetting, SearchSettings, SelectionStyle, Settings, UiSettings};
 
 use crate::language::Language;
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,15 @@ pub enum CursorStyle {
     Underline,
     BlinkingBar,
     Bar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaseMode {
+    /// Ignore case unless the search text has a capital letter.
+    Smart,
+    Sensitive,
+    Insensitive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +213,9 @@ pub struct ColorsConfig {
     pub status_error_fg: String,
     pub status_error_bg: String,
     pub selection: String,
+    pub search_match: String,
+    pub search_current: String,
+    pub search_current_text: String,
 }
 
 impl Default for ColorsConfig {
@@ -220,6 +232,35 @@ impl Default for ColorsConfig {
             status_error_fg: "white".into(),
             status_error_bg: "#8b2f2f".into(),
             selection: "reverse".into(),
+            search_match: "#58511f".into(),
+            search_current: "#f0a030".into(),
+            search_current_text: "black".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    pub case: CaseMode,
+    pub regex: bool,
+    pub whole_word: bool,
+    pub wrap_around: bool,
+    pub incremental: bool,
+    pub select_on_close: bool,
+    pub highlight_matches: bool,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            case: CaseMode::Smart,
+            regex: false,
+            whole_word: false,
+            wrap_around: true,
+            incremental: true,
+            select_on_close: true,
+            highlight_matches: true,
         }
     }
 }
@@ -250,6 +291,9 @@ pub struct CheckConfig {
     pub underline: bool,
     pub dotnet_target_framework: String,
     pub rust_edition: String,
+    /// Extra arguments for the C / C++ compiler, e.g. `["-Iinclude", "-std=c11"]`.
+    pub c_flags: Vec<String>,
+    pub cpp_flags: Vec<String>,
 }
 
 impl Default for CheckConfig {
@@ -262,12 +306,15 @@ impl Default for CheckConfig {
             underline: true,
             dotnet_target_framework: "auto".to_string(),
             rust_edition: "2021".to_string(),
+            c_flags: Vec::new(),
+            cpp_flags: Vec::new(),
         }
     }
 }
 
 /// Executables the checkers run. An empty string means "find it": Python
-/// tries `python3` then `python`, Godot tries `godot4` then `godot`.
+/// tries `python3` then `python`, Godot tries `godot4` then `godot`, the C
+/// compiler `cc`, `gcc`, `clang`, and the C++ one `c++`, `g++`, `clang++`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolsConfig {
@@ -277,6 +324,14 @@ pub struct ToolsConfig {
     pub node: String,
     pub python: String,
     pub godot: String,
+    pub cc: String,
+    pub cxx: String,
+    pub go: String,
+    pub javac: String,
+    pub php: String,
+    pub tsc: String,
+    pub kotlinc: String,
+    pub swiftc: String,
 }
 
 impl Default for ToolsConfig {
@@ -288,6 +343,14 @@ impl Default for ToolsConfig {
             node: "node".into(),
             python: String::new(),
             godot: String::new(),
+            cc: String::new(),
+            cxx: String::new(),
+            go: "go".into(),
+            javac: "javac".into(),
+            php: "php".into(),
+            tsc: "tsc".into(),
+            kotlinc: "kotlinc".into(),
+            swiftc: "swiftc".into(),
         }
     }
 }
@@ -323,6 +386,12 @@ pub struct KeysConfig {
     pub page_down: Vec<String>,
     pub word_left: Vec<String>,
     pub word_right: Vec<String>,
+    pub find: Vec<String>,
+    pub find_next: Vec<String>,
+    pub find_previous: Vec<String>,
+    pub find_toggle_case: Vec<String>,
+    pub find_toggle_whole_word: Vec<String>,
+    pub find_toggle_regex: Vec<String>,
 }
 
 fn chords(specs: &[&str]) -> Vec<String> {
@@ -361,6 +430,12 @@ impl Default for KeysConfig {
             page_down: chords(&["pagedown"]),
             word_left: chords(&["ctrl+left"]),
             word_right: chords(&["ctrl+right"]),
+            find: chords(&["ctrl+f"]),
+            find_next: chords(&["f3"]),
+            find_previous: chords(&["shift+f3"]),
+            find_toggle_case: chords(&["alt+c"]),
+            find_toggle_whole_word: chords(&["alt+w"]),
+            find_toggle_regex: chords(&["alt+r"]),
         }
     }
 }
@@ -404,6 +479,24 @@ impl KeysConfig {
             ("page_down", Action::PageDown, &self.page_down),
             ("word_left", Action::WordLeft, &self.word_left),
             ("word_right", Action::WordRight, &self.word_right),
+            ("find", Action::Find, &self.find),
+            ("find_next", Action::FindNext, &self.find_next),
+            ("find_previous", Action::FindPrevious, &self.find_previous),
+            (
+                "find_toggle_case",
+                Action::FindToggleCase,
+                &self.find_toggle_case,
+            ),
+            (
+                "find_toggle_whole_word",
+                Action::FindToggleWholeWord,
+                &self.find_toggle_whole_word,
+            ),
+            (
+                "find_toggle_regex",
+                Action::FindToggleRegex,
+                &self.find_toggle_regex,
+            ),
         ]
         .into_iter()
         .map(|(n, a, v)| (n, a, v.as_slice()))
@@ -469,6 +562,7 @@ pub struct Config {
     pub display: DisplayConfig,
     pub status_bar: StatusBarConfig,
     pub colors: ColorsConfig,
+    pub search: SearchConfig,
     pub syntax: SyntaxConfig,
     pub check: CheckConfig,
     pub tools: ToolsConfig,
